@@ -192,13 +192,14 @@ function assignVMToBrowser(browserId) {
   }
   
   // Find available VM that does NOT have deletion_needed flag
-  const availableVM = vmPool.find(vm => 
-    !vm.busy && 
-    (!vm.deletion_needed || vm.deletion_needed === false)
-  );
+  console.log(`Checking ${vmPool.length} VMs for availability`);
+  const availableVM = vmPool.find(vm => {
+    console.log(`VM ${vm.id}: busy=${vm.busy}, deletion_needed=${vm.deletion_needed}`);
+    return !vm.busy && (!vm.deletion_needed || vm.deletion_needed === false);
+  });
 
   if (!availableVM) {
-    console.log('No VMs available');
+    console.log('No VMs available after checking all VMs');
     return null; // No VMs available
   }
   
