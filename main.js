@@ -8,7 +8,9 @@ const { connect, StringCodec } = require('nats');
 require('dotenv').config();
 
 // Add a new session timeout mechanism with environment removal notification
-const ENV_SESSION_DURATION = parseInt(process.env.ENV_SESSION_DURATION || '14400000'); // 4 hours by default
+//const ENV_SESSION_DURATION = parseInt(process.env.ENV_SESSION_DURATION || '14400000'); // 4 hours by default
+const ENV_SESSION_DURATION = parseInt(process.env.ENV_SESSION_DURATION || '60000'); // 4 hours by default
+
 const ENV_CHECK_INTERVAL = 30000; // Check every 30 seconds
 
 // NATS connection configuration
@@ -162,129 +164,181 @@ function handleVMCreationError(errorData) {
   }
 }
 
-// Function to establish SSH connection
+// Establish SSH connection
 function establishSSHConnection(ws, vmIp) {
-  const ssh = new Client();
-  let stream = null;
+  // Configuration
+  const MAX_RETRIES = 10;
+  const INITIAL_RETRY_DELAY = 3000; // 3 seconds
+  const MAX_RETRY_DELAY = 15000; // 15 seconds
   
-  // Store SSH connection on websocket
-  ws.ssh = ssh;
-  
-  // Connect to the VM
-  console.log(`Connecting terminal ${ws.terminalId} to VM at ${vmIp}`);
-  
-  // Log SSH connection details (without sensitive info)
-  console.log(`SSH connection details: host=${vmIp}, port=${parseInt(process.env.SSH_PORT || '22')}, username=${process.env.VM_USER}`);
-  
-  // Add timeout for connection
-  const sshTimeout = setTimeout(() => {
-    console.error(`SSH connection timed out for ${ws.terminalId} to ${vmIp}`);
-    ssh.end();
-    ws.send(JSON.stringify({ 
-      type: 'error', 
-      message: 'SSH connection timed out' 
-    }));
-  }, 30000); // 30 second timeout
-  
-  ssh.on('ready', () => {
-    console.log(`SSH connection established to ${vmIp} for terminal ${ws.terminalId}`);
-    clearTimeout(sshTimeout);
+  let currentRetry = 0;
+  let retryDelay = INITIAL_RETRY_DELAY;
+
+  // Function to attempt SSH connection with retries
+  function attemptSSHConnection() {
+    const ssh = new Client();
+    let stream = null;
     
-    ws.send(JSON.stringify({ type: 'connected', message: 'SSH connection established' }));
+    // Store SSH connection on websocket
+    ws.ssh = ssh;
     
-    // Request a PTY (pseudo-terminal) with specific size
-    ssh.shell({ 
-      term: 'xterm-256color',
-      rows: 24,
-      cols: 80
-    }, (err, shellStream) => {
-      if (err) {
-        console.error(`Failed to open shell on ${vmIp}: ${err.message}`);
-        ws.send(JSON.stringify({ type: 'error', message: `Failed to open shell: ${err.message}` }));
-        return;
-      }
+    // Connect to the VM
+    console.log(`SSH connection attempt ${currentRetry + 1}/${MAX_RETRIES} for terminal ${ws.terminalId} to VM at ${vmIp}`);
+    
+    // Log SSH connection details (without sensitive info)
+    console.log(`SSH connection details: host=${vmIp}, port=${parseInt(process.env.SSH_PORT || '22')}, username=${process.env.VM_USER}`);
+    
+    // Add timeout for connection
+    const sshTimeout = setTimeout(() => {
+      console.error(`SSH connection timed out for ${ws.terminalId} to ${vmIp}`);
+      ssh.end();
+      handleConnectionFailure(new Error("SSH connection timed out"), ssh);
+    }, 30000); // 30 second timeout
+    
+    ssh.on('ready', () => {
+      console.log(`SSH connection established to ${vmIp} for terminal ${ws.terminalId}`);
+      clearTimeout(sshTimeout);
       
-      stream = shellStream;
-      ws.stream = stream;
+      ws.send(JSON.stringify({ type: 'connected', message: 'SSH connection established' }));
       
-      // Send raw SSH output directly to client
-      stream.on('data', (data) => {
-        ws.send(JSON.stringify({ 
-          type: 'data', 
-          data: data.toString('utf-8')
-        }));
-      });
-      
-      stream.stderr.on('data', (data) => {
-        const errorText = data.toString('utf-8');
-        console.error(`SSH stderr from ${vmIp}: ${errorText}`);
-        ws.send(JSON.stringify({ 
-          type: 'data', 
-          data: errorText
-        }));
-      });
-      
-      stream.on('close', () => {
-        console.log(`SSH stream closed for ${vmIp} (terminal ${ws.terminalId})`);
-        ws.send(JSON.stringify({ type: 'closed', message: 'SSH connection closed' }));
-        ssh.end();
+      // Request a PTY (pseudo-terminal) with specific size
+      ssh.shell({ 
+        term: 'xterm-256color',
+        rows: 24,
+        cols: 80
+      }, (err, shellStream) => {
+        if (err) {
+          console.error(`Failed to open shell on ${vmIp}: ${err.message}`);
+          ws.send(JSON.stringify({ type: 'error', message: `Failed to open shell: ${err.message}` }));
+          return;
+        }
+        
+        stream = shellStream;
+        ws.stream = stream;
+        
+        // Send raw SSH output directly to client
+        stream.on('data', (data) => {
+          ws.send(JSON.stringify({ 
+            type: 'data', 
+            data: data.toString('utf-8')
+          }));
+        });
+        
+        stream.stderr.on('data', (data) => {
+          const errorText = data.toString('utf-8');
+          console.error(`SSH stderr from ${vmIp}: ${errorText}`);
+          ws.send(JSON.stringify({ 
+            type: 'data', 
+            data: errorText
+          }));
+        });
+        
+        stream.on('close', () => {
+          console.log(`SSH stream closed for ${vmIp} (terminal ${ws.terminalId})`);
+          ws.send(JSON.stringify({ type: 'closed', message: 'SSH connection closed' }));
+          ssh.end();
+        });
       });
     });
-  });
-  
-  ssh.on('error', (err) => {
-    console.error(`SSH connection error for ${vmIp} (terminal ${ws.terminalId}): ${err.message}`);
-    console.error(`Error details:`, err);
-    clearTimeout(sshTimeout);
     
-    // Check for common SSH errors
-    let errorMessage = `SSH error: ${err.message}`;
-    if (err.level) {
-      errorMessage += ` (level: ${err.level})`;
+    ssh.on('error', (err) => {
+      clearTimeout(sshTimeout);
+      handleConnectionFailure(err, ssh);
+    });
+    
+    ssh.on('close', () => {
+      console.log(`SSH connection closed for ${vmIp} (terminal ${ws.terminalId})`);
+    });
+    
+    ssh.on('end', () => {
+      console.log(`SSH connection ended for ${vmIp} (terminal ${ws.terminalId})`);
+    });
+    
+    /*ssh.on('handshake', (negotiated) => {
+      //console.log(`SSH handshake completed for ${vmIp} with algorithms:`, negotiated);
+      console.log(`SSH handshake completed for ${vmIp}`);
+    });*/
+    
+    try {
+      ssh.connect({
+        host: vmIp,
+        port: parseInt(process.env.SSH_PORT || '22'),
+        username: process.env.VM_USER,
+        privateKey: fs.readFileSync(process.env.SSH_PRIVATE_KEY_PATH),
+        debug: process.env.SSH_DEBUG === 'true', // Enable debug output when env var is set
+        readyTimeout: 30000, // 30 second timeout
+        // Add connection parameters that might help with stability
+        keepaliveInterval: 5000, // Send keepalive every 5 seconds
+        keepaliveCountMax: 5,    // Allow 5 missed keepalives before disconnecting
+        algorithms: {
+          // Explicitly specify only the most common algorithms to avoid compatibility issues
+          kex: ['ecdh-sha2-nistp256', 'ecdh-sha2-nistp384', 'ecdh-sha2-nistp521', 'diffie-hellman-group-exchange-sha256'],
+          cipher: ['aes128-ctr', 'aes192-ctr', 'aes256-ctr'],
+          serverHostKey: ['ssh-rsa', 'ecdsa-sha2-nistp256', 'ssh-ed25519'],
+          hmac: ['hmac-sha2-256', 'hmac-sha2-512']
+        }
+      });
+    } catch (err) {
+      // Handle any synchronous exceptions during connection setup
+      clearTimeout(sshTimeout);
+      handleConnectionFailure(err, ssh);
+    }
+  }
+  
+  // Function to handle connection failures and retry if appropriate
+  function handleConnectionFailure(err, ssh) {
+    const errorDetails = {
+      message: err.message,
+      code: err.code,
+      level: err.level,
+      syscall: err.syscall,
+      errno: err.errno
+    };
+    
+    console.error(`SSH connection error for ${vmIp} (terminal ${ws.terminalId}): ${err.message}`);
+    console.error(`Error details:`, errorDetails);
+    
+    // Close failed connection
+    try {
+      ssh.end();
+    } catch (e) {
+      // Ignore errors when ending an already failed connection
     }
     
-    // Send a more detailed error message to the client
-    ws.send(JSON.stringify({ 
-      type: 'error', 
-      message: errorMessage,
-      details: {
-        code: err.code,
-        level: err.level
-      }
-    }));
-    
-    ws.close();
-  });
-  
-  ssh.on('keyboard-interactive', (name, instructions, lang, prompts, finish) => {
-    console.log(`SSH keyboard-interactive auth for ${vmIp}`);
-    // Generally this won't be triggered with key auth, but logging just in case
-  });
-  
-  ssh.on('handshake', (negotiated) => {
-    console.log(`SSH handshake completed for ${vmIp} with algorithms:`, negotiated);
-  });
-  
-  try {
-    ssh.connect({
-      host: vmIp,
-      port: parseInt(process.env.SSH_PORT || '22'),
-      username: process.env.VM_USER,
-      privateKey: fs.readFileSync(process.env.SSH_PRIVATE_KEY_PATH),
-      debug: true, // Enable debug output from the SSH library
-      readyTimeout: 30000, // 30 second timeout
-      authHandler: ['publickey'] // Force publickey authentication only
-    });
-  } catch (err) {
-    // Handle any synchronous exceptions during connection setup
-    console.error(`Exception connecting to SSH for ${vmIp}: ${err.message}`);
-    console.error(err.stack);
-    ws.send(JSON.stringify({ 
-      type: 'error', 
-      message: `SSH connection failed: ${err.message}`
-    }));
-    ws.close();
+    // Check if we should retry
+    if (currentRetry < MAX_RETRIES - 1) {
+      currentRetry++;
+      
+      // Notify client about retry
+      ws.send(JSON.stringify({ 
+        type: 'connecting', 
+        message: `SSH connection failed. Retrying (${currentRetry}/${MAX_RETRIES}) in ${retryDelay/1000} seconds...`,
+        attempt: currentRetry,
+        maxAttempts: MAX_RETRIES,
+        error: err.message
+      }));
+      
+      // Exponential backoff for next retry
+      setTimeout(() => {
+        attemptSSHConnection();
+        
+        // Increase delay for next retry (with a cap)
+        retryDelay = Math.min(retryDelay * 1.5, MAX_RETRY_DELAY);
+      }, retryDelay);
+    } else {
+      // No more retries, send final error to client
+      ws.send(JSON.stringify({ 
+        type: 'error', 
+        message: `SSH connection failed after ${MAX_RETRIES} attempts: ${err.message}`,
+        details: errorDetails
+      }));
+      
+      ws.close();
+    }
   }
+  
+  // Start first attempt
+  attemptSSHConnection();
 }
 
 // Function to trigger environment timeouts
