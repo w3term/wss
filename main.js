@@ -34,22 +34,50 @@ async function connectToNATS() {
     const subscription = natsConnection.subscribe('vm.created');
     console.log('Subscribed to vm.created channel');
     
-    // Process VM creation messages
-    for await (const msg of subscription) {
-      try {
-        const vmData = JSON.parse(sc.decode(msg.data));
-        console.log(`Received VM creation notification for: ${vmData.id}`);
-        
-        // Add the VM to our pool
-        handleVMCreated(vmData);
-      } catch (error) {
-        console.error('Error processing vm.created message:', error);
-      }
-    }
+    // Subscribe to VM creation error messages
+    const errorSubscription = natsConnection.subscribe('vm.creation.error');
+    console.log('Subscribed to vm.creation.error channel');
+    
+    // Process VM creation messages in a separate function
+    processVMCreationMessages(subscription);
+    
+    // Process VM creation error messages in a separate function
+    processVMCreationErrorMessages(errorSubscription);
+    
   } catch (error) {
     console.error('Error connecting to NATS:', error);
     // Retry connection after delay
     setTimeout(connectToNATS, 5000);
+  }
+}
+
+// Process VM creation messages
+async function processVMCreationMessages(subscription) {
+  for await (const msg of subscription) {
+    try {
+      const vmData = JSON.parse(sc.decode(msg.data));
+      console.log(`Received VM creation notification for: ${vmData.id}`);
+      
+      // Add the VM to our pool
+      handleVMCreated(vmData);
+    } catch (error) {
+      console.error('Error processing vm.created message:', error);
+    }
+  }
+}
+
+// Process VM creation error messages
+async function processVMCreationErrorMessages(subscription) {
+  for await (const msg of subscription) {
+    try {
+      const errorData = JSON.parse(sc.decode(msg.data));
+      console.log(`Received VM creation error for request ID: ${errorData.request_id}`);
+      
+      // Handle VM creation error
+      handleVMCreationError(errorData);
+    } catch (error) {
+      console.error('Error processing vm.creation.error message:', error);
+    }
   }
 }
 
@@ -98,6 +126,42 @@ function handleVMCreated(vmData) {
   }
 }
 
+// Handle VM creation error messages
+function handleVMCreationError(errorData) {
+  // Try to find the affected browser session
+  const requestId = errorData.request_id;
+  let affectedBrowserId = null;
+  
+  // Check if we can find a browser ID with a pending request
+  pendingVMRequests.forEach((request, browserId) => {
+    // If we find a match, notify clients
+    affectedBrowserId = browserId;
+  });
+  
+  if (affectedBrowserId) {
+    const pendingRequest = pendingVMRequests.get(affectedBrowserId);
+    
+    // Notify all waiting terminals for this browser
+    pendingRequest.pendingConnections.forEach((ws) => {
+      try {
+        ws.send(JSON.stringify({
+          type: 'error',
+          message: `VM creation failed: ${errorData.error}`,
+          details: errorData
+        }));
+      } catch (error) {
+        console.error('Error sending creation error message:', error);
+      }
+    });
+    
+    // Clean up the pending request
+    pendingVMRequests.delete(affectedBrowserId);
+    console.log(`Cleaned up pending VM request for browser ${affectedBrowserId} due to creation error`);
+  } else {
+    console.log(`Received VM creation error but couldn't match to pending request: ${JSON.stringify(errorData)}`);
+  }
+}
+
 // Function to establish SSH connection
 function establishSSHConnection(ws, vmIp) {
   const ssh = new Client();
@@ -108,15 +172,24 @@ function establishSSHConnection(ws, vmIp) {
   
   // Connect to the VM
   console.log(`Connecting terminal ${ws.terminalId} to VM at ${vmIp}`);
-  ssh.connect({
-    host: vmIp,
-    port: parseInt(process.env.SSH_PORT || '22'),
-    username: process.env.VM_USER,
-    privateKey: fs.readFileSync(process.env.SSH_PRIVATE_KEY_PATH)
-  });
   
-  // Handle SSH events
+  // Log SSH connection details (without sensitive info)
+  console.log(`SSH connection details: host=${vmIp}, port=${parseInt(process.env.SSH_PORT || '22')}, username=${process.env.VM_USER}`);
+  
+  // Add timeout for connection
+  const sshTimeout = setTimeout(() => {
+    console.error(`SSH connection timed out for ${ws.terminalId} to ${vmIp}`);
+    ssh.end();
+    ws.send(JSON.stringify({ 
+      type: 'error', 
+      message: 'SSH connection timed out' 
+    }));
+  }, 30000); // 30 second timeout
+  
   ssh.on('ready', () => {
+    console.log(`SSH connection established to ${vmIp} for terminal ${ws.terminalId}`);
+    clearTimeout(sshTimeout);
+    
     ws.send(JSON.stringify({ type: 'connected', message: 'SSH connection established' }));
     
     // Request a PTY (pseudo-terminal) with specific size
@@ -126,7 +199,8 @@ function establishSSHConnection(ws, vmIp) {
       cols: 80
     }, (err, shellStream) => {
       if (err) {
-        ws.send(JSON.stringify({ type: 'error', message: 'Failed to open shell' }));
+        console.error(`Failed to open shell on ${vmIp}: ${err.message}`);
+        ws.send(JSON.stringify({ type: 'error', message: `Failed to open shell: ${err.message}` }));
         return;
       }
       
@@ -142,13 +216,16 @@ function establishSSHConnection(ws, vmIp) {
       });
       
       stream.stderr.on('data', (data) => {
+        const errorText = data.toString('utf-8');
+        console.error(`SSH stderr from ${vmIp}: ${errorText}`);
         ws.send(JSON.stringify({ 
           type: 'data', 
-          data: data.toString('utf-8')
+          data: errorText
         }));
       });
       
       stream.on('close', () => {
+        console.log(`SSH stream closed for ${vmIp} (terminal ${ws.terminalId})`);
         ws.send(JSON.stringify({ type: 'closed', message: 'SSH connection closed' }));
         ssh.end();
       });
@@ -156,9 +233,58 @@ function establishSSHConnection(ws, vmIp) {
   });
   
   ssh.on('error', (err) => {
-    ws.send(JSON.stringify({ type: 'error', message: `SSH error: ${err.message}` }));
+    console.error(`SSH connection error for ${vmIp} (terminal ${ws.terminalId}): ${err.message}`);
+    console.error(`Error details:`, err);
+    clearTimeout(sshTimeout);
+    
+    // Check for common SSH errors
+    let errorMessage = `SSH error: ${err.message}`;
+    if (err.level) {
+      errorMessage += ` (level: ${err.level})`;
+    }
+    
+    // Send a more detailed error message to the client
+    ws.send(JSON.stringify({ 
+      type: 'error', 
+      message: errorMessage,
+      details: {
+        code: err.code,
+        level: err.level
+      }
+    }));
+    
     ws.close();
   });
+  
+  ssh.on('keyboard-interactive', (name, instructions, lang, prompts, finish) => {
+    console.log(`SSH keyboard-interactive auth for ${vmIp}`);
+    // Generally this won't be triggered with key auth, but logging just in case
+  });
+  
+  ssh.on('handshake', (negotiated) => {
+    console.log(`SSH handshake completed for ${vmIp} with algorithms:`, negotiated);
+  });
+  
+  try {
+    ssh.connect({
+      host: vmIp,
+      port: parseInt(process.env.SSH_PORT || '22'),
+      username: process.env.VM_USER,
+      privateKey: fs.readFileSync(process.env.SSH_PRIVATE_KEY_PATH),
+      debug: true, // Enable debug output from the SSH library
+      readyTimeout: 30000, // 30 second timeout
+      authHandler: ['publickey'] // Force publickey authentication only
+    });
+  } catch (err) {
+    // Handle any synchronous exceptions during connection setup
+    console.error(`Exception connecting to SSH for ${vmIp}: ${err.message}`);
+    console.error(err.stack);
+    ws.send(JSON.stringify({ 
+      type: 'error', 
+      message: `SSH connection failed: ${err.message}`
+    }));
+    ws.close();
+  }
 }
 
 // Function to trigger environment timeouts
@@ -400,8 +526,6 @@ wss.on('connection', (ws, req) => {
           
           // Assign a VM for this browser session
           const assignment = await assignVMToBrowser(browserId, terminalId, ws);
-          console.log("AFTER ASSIGNING VM TO BROWSER")
-
 
           if (!assignment) {
             // This is not an error, just means VM is being created
