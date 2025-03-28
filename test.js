@@ -1,37 +1,30 @@
-// ws-server.js - WebSocket server with browser-based VM allocation using NATS
 const WebSocket = require('ws');
 const { Client } = require('ssh2');
 const fs = require('fs');
 const path = require('path');
 const jwt = require('jsonwebtoken');
 const { connect, StringCodec } = require('nats');
-const { v4: uuidv4 } = require('uuid'); // Add this dependency for request IDs
+const { v4: uuidv4 } = require('uuid');
 require('dotenv').config();
 
-// Add a new session timeout mechanism with environment removal notification
-//const ENV_SESSION_DURATION = parseInt(process.env.ENV_SESSION_DURATION || '14400000'); // 4 hours by default
+// Session timeout mechanism with environment removal notification
 const ENV_SESSION_DURATION = parseInt(process.env.ENV_SESSION_DURATION || '60000'); // 1 minute by default for testing
-
 const ENV_CHECK_INTERVAL = 30000; // Check every 30 seconds
 
-// Cooldown configuration - Add this for Issue 2
-const BROWSER_COOLDOWN_DURATION = parseInt(process.env.BROWSER_COOLDOWN_DURATION || '300000'); // 5 minutes by default
-const terminatedBrowsers = new Map(); // Map to track browsers in cooldown period
+// Cooldown configuration
+const USER_COOLDOWN_DURATION = parseInt(process.env.USER_COOLDOWN_DURATION || '300000'); // 5 minutes by default
 
 // NATS connection configuration
 const NATS_URL = process.env.NATS_URL || 'nats://localhost:4222';
 let natsConnection = null;
 const sc = StringCodec();
 
-// In-memory VM pool
+// Track list of VMs
 let vmPool = [];
-
-// Map to track browser sessions and their assigned VMs
-const browserSessions = new Map();
-// Map to track pending VM creation requests
+const userSessions = new Map();
 const pendingVMRequests = new Map();
-// Map to track pending VM deletion requests - Add for Issue 1
 const pendingVMDeletions = new Map();
+const terminatedUsers = new Map();
 
 // Connect to NATS
 async function connectToNATS() {
@@ -131,25 +124,25 @@ function handleVMCreated(vmData) {
   vmPool.push(vmData);
   
   // Check if we have pending requests for this VM
-  const browserId = vmData.browserId;
+  const userId = vmData.userId;
   
-  if (browserId && pendingVMRequests.has(browserId)) {
-    const pendingRequest = pendingVMRequests.get(browserId);
-    pendingVMRequests.delete(browserId);
+  if (userId && pendingVMRequests.has(userId)) {
+    const pendingRequest = pendingVMRequests.get(userId);
+    pendingVMRequests.delete(userId);
     
-    // Create browser session assignment
-    browserSessions.set(browserId, {
+    // Create user session assignment
+    userSessions.set(userId, {
       vmId: vmData.id,
       vmIp: vmData.ip,
       assignedAt: Date.now(),
       terminals: new Set(pendingRequest.terminals)
     });
     
-    console.log(`VM ${vmData.id} (${vmData.ip}) is now ready for browser ${browserId}`);
+    console.log(`VM ${vmData.id} (${vmData.ip}) is now ready for user ${userId}`);
     
     // Notify clients that VM is ready
     wss.clients.forEach((ws) => {
-      if (ws.browserId === browserId) {
+      if (ws.userId === userId) {
         try {
           ws.send(JSON.stringify({
             type: 'vm_ready',
@@ -172,20 +165,20 @@ function handleVMCreated(vmData) {
 
 // Handle VM creation error messages
 function handleVMCreationError(errorData) {
-  // Try to find the affected browser session
+  // Try to find the affected user session
   const requestId = errorData.request_id;
-  let affectedBrowserId = null;
+  let affectedUserId = null;
   
-  // Check if we can find a browser ID with a pending request
-  pendingVMRequests.forEach((request, browserId) => {
+  // Check if we can find a user ID with a pending request
+  pendingVMRequests.forEach((request, userId) => {
     // If we find a match, notify clients
-    affectedBrowserId = browserId;
+    affectedUserId = userId;
   });
   
-  if (affectedBrowserId) {
-    const pendingRequest = pendingVMRequests.get(affectedBrowserId);
+  if (affectedUserId) {
+    const pendingRequest = pendingVMRequests.get(affectedUserId);
     
-    // Notify all waiting terminals for this browser
+    // Notify all waiting terminals for this user
     pendingRequest.pendingConnections.forEach((ws) => {
       try {
         ws.send(JSON.stringify({
@@ -199,8 +192,8 @@ function handleVMCreationError(errorData) {
     });
     
     // Clean up the pending request
-    pendingVMRequests.delete(affectedBrowserId);
-    console.log(`Cleaned up pending VM request for browser ${affectedBrowserId} due to creation error`);
+    pendingVMRequests.delete(affectedUserId);
+    console.log(`Cleaned up pending VM request for user ${affectedUserId} due to creation error`);
   } else {
     console.log(`Received VM creation error but couldn't match to pending request: ${JSON.stringify(errorData)}`);
   }
@@ -388,12 +381,11 @@ function checkEnvironmentTimeout() {
   const now = Date.now();
   console.log(`Running environment timeout check at ${new Date(now).toISOString()}`);
   
-  browserSessions.forEach((assignment, browserId) => {
-    // Check if the environment has exceeded its max duration
+  userSessions.forEach((assignment, userId) => {
     const sessionDuration = now - assignment.assignedAt;
     
     if (sessionDuration > ENV_SESSION_DURATION) {
-      console.log(`TIMEOUT TRIGGERED for browser ${browserId}, session duration: ${sessionDuration}ms, threshold: ${ENV_SESSION_DURATION}ms`);
+      console.log(`TIMEOUT TRIGGERED for user ${userId}, session duration: ${sessionDuration}ms, threshold: ${ENV_SESSION_DURATION}ms`);
       
       // Find the VM in the pool
       const vmToDelete = vmPool.find(vm => vm.id === assignment.vmId);
@@ -401,10 +393,10 @@ function checkEnvironmentTimeout() {
       if (vmToDelete) {
         console.log(`Found VM to delete: ${vmToDelete.id}`);
         
-        // First, close all WebSocket connections for this browser
+        // First, close all WebSocket connections for this client
         let closedConnections = 0;
         wss.clients.forEach((ws) => {
-          if (ws.browserId === browserId) {
+          if (ws.userId === userId) {
             try {
               // Try to send a termination message, but don't worry if it fails
               if (ws.readyState === WebSocket.OPEN) {
@@ -428,43 +420,43 @@ function checkEnvironmentTimeout() {
           }
         });
         
-        console.log(`Forcibly closed ${closedConnections} connections for browser ${browserId}`);
+        console.log(`Forcibly closed ${closedConnections} connections for user ${userId}`);
         
         // Request VM deletion via NATS
-        requestVMDeletion(vmToDelete.id, browserId, 'session_timeout');
+        requestVMDeletion(vmToDelete.id, userId, 'session_timeout');
         
-        // Add browser to cooldown list - Issue 2 solution
-        addBrowserToCooldown(browserId);
+        // Add user to cooldown list
+        addUserToCooldown(userId);
       }
       
-      // Release the VM from browser sessions
-      releaseVM(browserId);
+      // Release the VM from user sessions
+      releaseVM(userId);
     }
   });
 }
 
-// Function to add a browser to the cooldown list - Part of Issue 2 solution
-function addBrowserToCooldown(browserId) {
-  const expiresAt = Date.now() + BROWSER_COOLDOWN_DURATION;
-  terminatedBrowsers.set(browserId, expiresAt);
-  console.log(`Added browser ${browserId} to cooldown until ${new Date(expiresAt).toISOString()}`);
+// Function to add a user to the cooldown list
+function addUserToCooldown(userId) {
+  const expiresAt = Date.now() + USER_COOLDOWN_DURATION;
+  terminatedUsers.set(userId, expiresAt);
+  console.log(`Added user ${userId} to cooldown until ${new Date(expiresAt).toISOString()}`);
 }
 
-// Function to check if a browser is in cooldown - Part of Issue 2 solution
-function isBrowserInCooldown(browserId) {
-  if (terminatedBrowsers.has(browserId)) {
-    const expiresAt = terminatedBrowsers.get(browserId);
+// Function to check if a user is in cooldown
+function isUserInCooldown(userId) {
+  if (terminatedUsers.has(userId)) {
+    const expiresAt = terminatedUsers.get(userId);
     const now = Date.now();
     
     if (now < expiresAt) {
       // Still in cooldown
       const remainingTime = Math.ceil((expiresAt - now) / 1000);
-      console.log(`Browser ${browserId} is in cooldown for ${remainingTime} more seconds`);
+      console.log(`User ${userId} is in cooldown for ${remainingTime} more seconds`);
       return true;
     } else {
       // Cooldown expired, remove from map
-      terminatedBrowsers.delete(browserId);
-      console.log(`Browser ${browserId} cooldown expired, removed from restrictions`);
+      terminatedUsers.delete(userId);
+      console.log(`User ${userId} cooldown expired, removed from restrictions`);
       return false;
     }
   }
@@ -472,8 +464,8 @@ function isBrowserInCooldown(browserId) {
   return false;
 }
 
-// Modified: Function to request VM deletion via NATS with request-reply pattern - Issue 1 solution
-async function requestVMDeletion(vmId, browserId, reason) {
+// Modified: Function to request VM deletion via NATS with request-reply pattern
+async function requestVMDeletion(vmId, userId, reason) {
   if (!natsConnection) {
     console.error('Cannot request VM deletion: NATS connection not available');
     return;
@@ -486,7 +478,7 @@ async function requestVMDeletion(vmId, browserId, reason) {
     // Store deletion request in pending map
     pendingVMDeletions.set(requestId, {
       vmId,
-      browserId,
+      userId,
       reason,
       requestedAt: Date.now()
     });
@@ -497,7 +489,7 @@ async function requestVMDeletion(vmId, browserId, reason) {
       sc.encode(JSON.stringify({
         requestId: requestId,
         vmId: vmId,
-        browserId: browserId,
+        userId: userId,
         reason: reason,
         timestamp: Date.now()
       })),
@@ -533,15 +525,15 @@ setInterval(() => {
   const now = Date.now();
   let expiredCount = 0;
   
-  terminatedBrowsers.forEach((expiresAt, browserId) => {
+  terminatedUsers.forEach((expiresAt, userId) => {
     if (now >= expiresAt) {
-      terminatedBrowsers.delete(browserId);
+      terminatedUsers.delete(userId);
       expiredCount++;
     }
   });
   
   if (expiredCount > 0) {
-    console.log(`Cleaned up ${expiredCount} expired browser cooldowns`);
+    console.log(`Cleaned up ${expiredCount} expired user cooldowns`);
   }
 }, 60000); // Check every minute
 
@@ -561,47 +553,44 @@ process.on('SIGINT', async () => {
   process.exit(0);
 });
 
-// Function to assign a VM to a browser session
-async function assignVMToBrowser(browserId, terminalId, ws) {
-  // Check if browser already has a VM
-  const existingAssignment = browserSessions.get(browserId);
-  if (existingAssignment) {
-    // Add this terminal to the existing session
-    existingAssignment.terminals.add(terminalId);
-    
-    // Return existing assignment
-    return existingAssignment;
-  }
+// Function to assign a VM to a user session
+async function assignVMToUser(userId, terminalId, ws) {
+    // Existing assignment check - simpler now
+    if (userSessions.has(userId)) {
+        const existingAssignment = userSessions.get(userId);
+        existingAssignment.terminals.add(terminalId);
+        return existingAssignment;
+    }
+
   
-  // Check if there's a pending request for this browser
-  if (pendingVMRequests.has(browserId)) {
-    // Add this terminal to the pending request
-    const pendingRequest = pendingVMRequests.get(browserId);
-    pendingRequest.terminals.add(terminalId);
-    pendingRequest.pendingConnections.set(terminalId, ws);
-    
-    // Let client know we're still waiting for VM
-    ws.send(JSON.stringify({
-      type: 'vm_creating',
-      message: 'Your environment is being created. Please wait...'
-    }));
-    
-    return null;
-  }
+    // Check if there's a pending request for this user
+    if (pendingVMRequests.has(userId)) {
+        // Add this terminal to the pending request
+        const pendingRequest = pendingVMRequests.get(userId);
+        pendingRequest.terminals.add(terminalId);
+        pendingRequest.pendingConnections.set(terminalId, ws);
+        
+        // Let client know we're still waiting for VM
+        ws.send(JSON.stringify({
+            type: 'vm_creating',
+            message: 'Your environment is being created. Please wait...'
+        }));
+        
+        return null;
+    }
   
-  // Issue 2 solution: Check if browser is in cooldown period
-  if (isBrowserInCooldown(browserId)) {
-    // Calculate remaining cooldown time
-    const remainingSeconds = Math.ceil((terminatedBrowsers.get(browserId) - Date.now()) / 1000);
-    
-    // Notify client about cooldown
-    ws.send(JSON.stringify({
-      type: 'error',
-      message: `Your previous session recently expired. Please wait ${remainingSeconds} seconds before starting a new session.`
-    }));
-    
-    return null;
-  }
+    if (isUserInCooldown(userId)) {
+        // Calculate remaining cooldown time
+        const remainingSeconds = Math.ceil((terminatedUsers.get(userId) - Date.now()) / 1000);
+        
+        // Notify client about cooldown
+        ws.send(JSON.stringify({
+        type: 'error',
+        message: `Your previous session recently expired. Please wait ${remainingSeconds} seconds before starting a new session.`
+        }));
+        
+        return null;
+    }
   
   // Find available VM in current pool
   const availableVM = vmPool.find(vm => !vm.busy);
@@ -609,18 +598,18 @@ async function assignVMToBrowser(browserId, terminalId, ws) {
   if (availableVM) {
     // Mark VM as busy
     availableVM.busy = true;
-    availableVM.browserId = browserId;
+    availableVM.userId = userId;
     
-    // Create browser session
-    browserSessions.set(browserId, {
+    // Create user session
+    userSessions.set(userId, {
       vmId: availableVM.id,
       vmIp: availableVM.ip,
       assignedAt: Date.now(),
       terminals: new Set([terminalId])
     });
     
-    console.log(`Assigned existing VM ${availableVM.id} (${availableVM.ip}) to browser ${browserId}`);
-    return browserSessions.get(browserId);
+    console.log(`Assigned existing VM ${availableVM.id} (${availableVM.ip}) to user ${userId}`);
+    return userSessions.get(userId);
   }
   
   // No existing VM available, request new one via NATS
@@ -630,7 +619,7 @@ async function assignVMToBrowser(browserId, terminalId, ws) {
   }
   
   // Create a pending request entry
-  pendingVMRequests.set(browserId, {
+  pendingVMRequests.set(userId, {
     requestedAt: Date.now(),
     terminals: new Set([terminalId]),
     pendingConnections: new Map([[terminalId, ws]])
@@ -642,7 +631,7 @@ async function assignVMToBrowser(browserId, terminalId, ws) {
     message: 'Your environment is being created. Please wait...'
   }));
   
-  console.log(`No VM available, will request one via NATS for browser ${browserId}`);
+  console.log(`No VM available, will request one via NATS for user ${userId}`);
   console.log(`NATS connection status:`, natsConnection ? 'Connected' : 'Not connected');  
 
   // Request VM creation
@@ -653,7 +642,7 @@ async function assignVMToBrowser(browserId, terminalId, ws) {
     // Send request-reply message
     const reply = await natsConnection.request('vm.create', sc.encode(JSON.stringify({
       requestId: requestId,
-      browserId: browserId,
+      userId: userId,
       requestedAt: Date.now()
     })), { timeout: 10000 });
     
@@ -663,10 +652,10 @@ async function assignVMToBrowser(browserId, terminalId, ws) {
     // The actual VM details will come later on the vm.created subscription
     return null;
   } catch (error) {
-    console.error(`Error requesting VM creation for browser ${browserId}:`, error);
+    console.error(`Error requesting VM creation for user ${userId}:`, error);
     
     // Clean up pending request on error
-    pendingVMRequests.delete(browserId);
+    pendingVMRequests.delete(userId);
     
     // Notify client of error
     ws.send(JSON.stringify({
@@ -678,9 +667,9 @@ async function assignVMToBrowser(browserId, terminalId, ws) {
   }
 }
 
-// Function to release a VM when browser session ends
-function releaseVM(browserId) {
-  const assignment = browserSessions.get(browserId);
+// Function to release a VM when user session ends
+function releaseVM(userId) {
+  const assignment = userSessions.get(userId);
   if (!assignment) return;
   
   // Find the VM in the pool
@@ -688,12 +677,12 @@ function releaseVM(browserId) {
   if (vm) {
     // If VM is in our pool, mark it as no longer busy
     vm.busy = false;
-    vm.browserId = null;
-    console.log(`Released VM ${vm.id} (${vm.ip}) from browser ${browserId}`);
+    vm.userId = null;
+    console.log(`Released VM ${vm.id} (${vm.ip}) from user ${userId}`);
   }
   
   // Remove from sessions map
-  browserSessions.delete(browserId);
+  userSessions.delete(userId);
 }
 
 // Create WebSocket server
@@ -703,16 +692,19 @@ wss.on('connection', (ws, req) => {
   // Parse query parameters
   const urlParams = new URL(`http://localhost${req.url}`).searchParams;
   
-  // Get or generate browser ID - this should be consistent for tabs in the same browser
-  const browserId = urlParams.get('browserid') || `browser_${Date.now()}_${Math.random().toString(36).substring(2, 15)}`;
-  
+  const userId = urlParams.get('userid');
+  if (!userId) {
+    ws.send(JSON.stringify({ type: 'error', message: 'Authentication required' }));
+    ws.close();
+    return;
+  }
   // Terminal ID is unique per terminal tab
   const terminalId = urlParams.get('terminalid') || `terminal_${Date.now()}_${Math.random().toString(36).substring(2, 15)}`;
   
-  console.log(`Terminal ${terminalId} connected from browser ${browserId}`);
+  console.log(`Terminal ${terminalId} connected from user ${userId}`);
   
   // Store session info on the websocket object
-  ws.browserId = browserId;
+  ws.userId = userId;
   ws.terminalId = terminalId;
   
   // Handle messages from client
@@ -728,11 +720,10 @@ wss.on('connection', (ws, req) => {
           //  jwt.verify(data.token, process.env.JWT_SECRET);
           //}
           
-          // Check if browser is in cooldown before trying to assign a VM
-          if (isBrowserInCooldown(browserId)) {
+          if (isUserInCooldown(userId)) {
             // Calculate remaining cooldown time
-            const remainingSeconds = Math.ceil((terminatedBrowsers.get(browserId) - Date.now()) / 1000);
-            
+            const remainingSeconds = Math.ceil((terminatedUsers.get(userId) - Date.now()) / 1000);
+    
             // Notify client about cooldown
             ws.send(JSON.stringify({
               type: 'error',
@@ -742,12 +733,20 @@ wss.on('connection', (ws, req) => {
             return;
           }
           
-          // Assign a VM for this browser session
-          const assignment = await assignVMToBrowser(browserId, terminalId, ws);
+          if (userSessions.has(userId)) {
+            ws.send(JSON.stringify({
+              type: 'error',
+              message: 'You already have an active VM session. Please use that session or terminate it first.'
+            }));
+            return;
+          }
+
+          // Assign a VM for this user
+          const assignment = await assignVMToUser(userId, terminalId, ws);
 
           if (!assignment) {
             // This is not an error, just means VM is being created
-            // Client has already been notified via ws.send in assignVMToBrowser
+            // Client has already been notified via ws.send in assignVMToUser
             return;
           }
           
@@ -777,7 +776,7 @@ wss.on('connection', (ws, req) => {
   
   // Handle client disconnect
   ws.on('close', () => {
-    console.log(`Terminal ${terminalId} from browser ${browserId} disconnected`);
+    console.log(`Terminal ${terminalId} from user ${userId} disconnected`);
     
     // Close SSH connection if exists
     if (ws.stream) {
@@ -796,16 +795,16 @@ wss.on('connection', (ws, req) => {
       }
     }
     
-    // Check if there's a pending VM request for this browser
-    if (pendingVMRequests.has(browserId)) {
-      const pendingRequest = pendingVMRequests.get(browserId);
+    // Check if there's a pending VM request for this user
+    if (pendingVMRequests.has(userId)) {
+      const pendingRequest = pendingVMRequests.get(userId);
       pendingRequest.terminals.delete(terminalId);
       pendingRequest.pendingConnections.delete(terminalId);
       
       // If no more terminals are waiting, cancel the VM request
       if (pendingRequest.terminals.size === 0) {
-        console.log(`No more terminals waiting for VM, canceling request for browser ${browserId}`);
-        pendingVMRequests.delete(browserId);
+        console.log(`No more terminals waiting for VM, canceling request for user ${userId}`);
+        pendingVMRequests.delete(userId);
         
         // Optionally notify VM service to cancel creation if possible
         if (natsConnection) {
@@ -816,7 +815,7 @@ wss.on('connection', (ws, req) => {
               'vm.cancel', 
               sc.encode(JSON.stringify({
                 requestId: requestId,
-                browserId: browserId,
+                userId: userId,
                 timestamp: Date.now()
               })), 
               { timeout: 5000 }
@@ -835,16 +834,16 @@ wss.on('connection', (ws, req) => {
     }
     
     // If not pending, check active sessions
-    const assignment = browserSessions.get(browserId);
+    const assignment = userSessions.get(userId);
     if (assignment) {
       assignment.terminals.delete(terminalId);
       
-      // Only release the VM if no terminals from this browser are connected
+      // Only release the VM if no terminals from this user are connected
       if (assignment.terminals.size === 0) {
-        console.log(`No more terminals from browser ${browserId}, releasing VM ${assignment.vmId}`);
-        releaseVM(browserId);
+        console.log(`No more terminals from user ${userId}, releasing VM ${assignment.vmId}`);
+        releaseVM(userId);
       } else {
-        console.log(`Browser ${browserId} still has ${assignment.terminals.size} active terminals`);
+        console.log(`User ${userId} still has ${assignment.terminals.size} active terminals`);
       }
     }
   });
@@ -855,10 +854,10 @@ setInterval(() => {
   const now = Date.now();
   
   // Check for abandoned pending VM requests
-  pendingVMRequests.forEach((request, browserId) => {
+  pendingVMRequests.forEach((request, userId) => {
     // If a pending request is older than 10 minutes, consider it abandoned
     if (now - request.requestedAt > 600000) { // 10 minutes
-      console.log(`Pending VM request for browser ${browserId} timed out`);
+      console.log(`Pending VM request for user ${userId} timed out`);
       
       // Notify all waiting terminals
       request.pendingConnections.forEach((ws) => {
@@ -873,7 +872,7 @@ setInterval(() => {
       });
       
       // Clean up the pending request
-      pendingVMRequests.delete(browserId);
+      pendingVMRequests.delete(userId);
       
       // Try to cancel VM creation using request-reply pattern
       if (natsConnection) {
@@ -881,7 +880,7 @@ setInterval(() => {
           const requestId = uuidv4();
           natsConnection.request('vm.cancel', sc.encode(JSON.stringify({
             requestId: requestId,
-            browserId: browserId,
+            userId: userId,
             reason: 'timeout',
             timestamp: Date.now()
           })), { timeout: 5000 }).then(reply => {
@@ -913,7 +912,7 @@ setInterval(() => {
             requestId: newRequestId,
             originalRequestId: requestId,
             vmId: deletion.vmId,
-            browserId: deletion.browserId,
+            userId: deletion.userId,
             reason: `${deletion.reason}_retry`,
             timestamp: Date.now(),
             isRetry: true
@@ -950,37 +949,37 @@ setInterval(() => {
   
   console.log(`\n--- System Status at ${new Date(now).toISOString()} ---`);
   console.log(`Active VM pool: ${vmPool.length} VMs`);
-  console.log(`Active browser sessions: ${browserSessions.size}`);
+  console.log(`Active user sessions: ${userSessions.size}`);
   console.log(`Pending VM requests: ${pendingVMRequests.size}`);
   console.log(`Pending VM deletions: ${pendingVMDeletions.size}`);
-  console.log(`Browsers in cooldown: ${terminatedBrowsers.size}`);
+  console.log(`Users in cooldown: ${terminatedUsers.size}`);
   
   // Detailed VM Pool Stats
   if (vmPool.length > 0) {
     console.log(`\nVM Pool Details:`);
     vmPool.forEach(vm => {
-      console.log(`- VM ${vm.id} (${vm.ip}): ${vm.busy ? 'Busy' : 'Available'}${vm.browserId ? ` (used by ${vm.browserId})` : ''}`);
+      console.log(`- VM ${vm.id} (${vm.ip}): ${vm.busy ? 'Busy' : 'Available'}${vm.userId ? ` (used by ${vm.userId})` : ''}`);
     });
   }
   
-  // Browser sessions with their VMs
-  if (browserSessions.size > 0) {
-    console.log(`\nBrowser Sessions:`);
-    browserSessions.forEach((session, browserId) => {
+  // User sessions with their VMs
+  if (userSessions.size > 0) {
+    console.log(`\nUser Sessions:`);
+    userSessions.forEach((session, userId) => {
       const sessionDuration = Math.floor((now - session.assignedAt) / 1000);
       const timeLeft = Math.floor((ENV_SESSION_DURATION - (now - session.assignedAt)) / 1000);
       
-      console.log(`- Browser ${browserId}: VM ${session.vmId} (${session.vmIp})`);
+      console.log(`- User ${userId}: VM ${session.vmId} (${session.vmIp})`);
       console.log(`  Terminals: ${session.terminals.size}, Duration: ${sessionDuration}s, Time left: ${timeLeft}s`);
     });
   }
   
-  // Browsers in cooldown
-  if (terminatedBrowsers.size > 0) {
-    console.log(`\nBrowsers in Cooldown:`);
-    terminatedBrowsers.forEach((expiresAt, browserId) => {
+  // Users in cooldown
+  if (terminatedUsers.size > 0) {
+    console.log(`\nUsers in Cooldown:`);
+    terminatedUsers.forEach((expiresAt, userId) => {
       const cooldownLeft = Math.floor((expiresAt - now) / 1000);
-      console.log(`- Browser ${browserId}: ${cooldownLeft}s remaining`);
+      console.log(`- User ${userId}: ${cooldownLeft}s remaining`);
     });
   }
   
@@ -993,7 +992,7 @@ console.log(`WebSocket server running on port ${port}`);
 // Log initial configuration
 console.log(`Server configuration:
 - Environment session duration: ${ENV_SESSION_DURATION}ms (${ENV_SESSION_DURATION/60000} minutes)
-- Browser cooldown duration: ${BROWSER_COOLDOWN_DURATION}ms (${BROWSER_COOLDOWN_DURATION/60000} minutes)
+- User cooldown duration: ${USER_COOLDOWN_DURATION}ms (${USER_COOLDOWN_DURATION/60000} minutes)
 - Environment check interval: ${ENV_CHECK_INTERVAL}ms
 - NATS server: ${NATS_URL}
 `);
