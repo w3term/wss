@@ -686,7 +686,7 @@ function releaseVM(userId) {
 }
 
 // Create WebSocket server
-const wss = new WebSocket.Server({ port: process.env.WS_PORT || 8080 });
+const wss = new WebSocket.Server({ port: process.env.WS_PORT || 8081 });
 
 wss.on('connection', (ws, req) => {
   // Parse query parameters
@@ -986,7 +986,7 @@ setInterval(() => {
   console.log(`---------------------------------------------\n`);
 }, 300000); // Log status every 5 minutes
 
-const port = process.env.WS_PORT || 8080;
+const port = process.env.WS_PORT || 8081;
 console.log(`WebSocket server running on port ${port}`);
 
 // Log initial configuration

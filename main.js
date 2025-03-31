@@ -559,7 +559,7 @@ function releaseVM(browserId) {
 }
 
 // Create WebSocket server
-const wss = new WebSocket.Server({ port: process.env.WS_PORT || 8080 });
+const wss = new WebSocket.Server({ port: process.env.WS_PORT || 8081 });
 
 wss.on('connection', (ws, req) => {
   // Parse query parameters
@@ -727,7 +727,7 @@ setInterval(() => {
   });
 }, 60000); // Check every minute
 
-const port = process.env.WS_PORT || 8080;
+const port = process.env.WS_PORT || 8081;
 console.log(`WebSocket server running on port ${port}`);
 
 // Connect to NATS and start the server
