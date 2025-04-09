@@ -426,13 +426,30 @@ function checkEnvironmentTimeout() {
               // Try to send a termination message, but don't worry if it fails
               if (ws.readyState === WebSocket.OPEN) {
                 try {
+                  // Calculate the cooldown expiry time
+                  const expiryTime = Date.now() + USER_COOLDOWN_DURATION;
+                  const cooldownDate = new Date(expiryTime);
+                  
+                  // Format time as HH:MM
+                  const hours = cooldownDate.getHours().toString().padStart(2, '0');
+                  const minutes = cooldownDate.getMinutes().toString().padStart(2, '0');
+                  const formattedTime = `${hours}:${minutes}`;
+                  
+                  console.log(`Sending environment_terminated to ${ws.userId} with cooldown until ${formattedTime}`);
+                  
+                  // When terminating an environment
                   ws.send(JSON.stringify({
                     type: 'environment_terminated',
                     message: 'Environment session expired.',
-                    vmId: vmToDelete.id
+                    vmId: vmToDelete.id,
+                    cooldown: {
+                      expiryTimestamp: expiryTime,
+                      formattedTime: formattedTime,
+                      reason: 'session_timeout'
+                    }
                   }));
                 } catch (err) {
-                  // Ignore send errors
+                  console.error(`Error sending termination message: ${err.message}`);
                 }
               }
               
@@ -462,21 +479,50 @@ function checkEnvironmentTimeout() {
 
 // Function to add a user to the cooldown list
 function addUserToCooldown(userId) {
-  const expiresAt = Date.now() + USER_COOLDOWN_DURATION;
-  terminatedUsers.set(userId, expiresAt);
-  console.log(`Added user ${userId} to cooldown until ${new Date(expiresAt).toISOString()}`);
+  const expiryTime = Date.now() + USER_COOLDOWN_DURATION;
+  terminatedUsers.set(userId, expiryTime);
+  console.log(`Added user ${userId} to cooldown until ${new Date(expiryTime).toISOString()}`);
 }
 
 // Function to check if a user is in cooldown
-function isUserInCooldown(userId) {
+// Function to check if a user is in cooldown
+function isUserInCooldown(userId, ws) {
   if (terminatedUsers.has(userId)) {
     const expiresAt = terminatedUsers.get(userId);
     const now = Date.now();
     
     if (now < expiresAt) {
       // Still in cooldown
+      // Calculate remainingTime - THIS WAS MISSING OR INCORRECTLY PLACED
       const remainingTime = Math.ceil((expiresAt - now) / 1000);
+      
+      // Calculate a rounded-up expiry time for display
+      const displayExpiryTime = new Date(expiresAt);
+      // Round to next minute if there are seconds
+      if (displayExpiryTime.getSeconds() > 0) {
+        displayExpiryTime.setMinutes(displayExpiryTime.getMinutes() + 1);
+        displayExpiryTime.setSeconds(0);
+      }
+      
+      // Format time as HH:MM
+      const hours = displayExpiryTime.getHours().toString().padStart(2, '0');
+      const minutes = displayExpiryTime.getMinutes().toString().padStart(2, '0');
+      const formattedTime = `${hours}:${minutes}`;
+      
       console.log(`User ${userId} is in cooldown for ${remainingTime} more seconds`);
+      
+      // Only send a message if ws is provided and open
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+          type: 'error',
+          message: `Your previous session recently expired. Please wait ${remainingTime} seconds before starting a new session.`,
+          cooldown: {
+            expiryTimestamp: expiresAt,
+            formattedTime: formattedTime
+          }
+        }));
+      }
+      
       return true;
     } else {
       // Cooldown expired, remove from map
@@ -485,7 +531,6 @@ function isUserInCooldown(userId) {
       return false;
     }
   }
-  
   return false;
 }
 
@@ -550,8 +595,8 @@ setInterval(() => {
   const now = Date.now();
   let expiredCount = 0;
   
-  terminatedUsers.forEach((expiresAt, userId) => {
-    if (now >= expiresAt) {
+  terminatedUsers.forEach((expiryTime, userId) => {
+    if (now >= expiryTime) {
       terminatedUsers.delete(userId);
       expiredCount++;
     }
@@ -580,6 +625,23 @@ process.on('SIGINT', async () => {
 
 // Function to assign a VM to a user session
 async function assignVMToUser(userId, terminalId, ws) {
+    // Check for pending VM request first
+    if (pendingVMRequests.has(userId)) {
+      console.log(`User ${userId} already has a pending VM request, connecting to existing request`);
+      
+      const pendingRequest = pendingVMRequests.get(userId);
+      pendingRequest.terminals.add(terminalId);
+      pendingRequest.pendingConnections.set(terminalId, ws);
+      
+      // Notify client that VM is being created
+      ws.send(JSON.stringify({
+        type: 'vm_creating',
+        message: 'Your environment is already being created. Please wait...'
+      }));
+      
+      return null;
+    }
+
     // Check for existing assignment first
     if (userSessions.has(userId)) {
         const existingAssignment = userSessions.get(userId);
@@ -589,7 +651,7 @@ async function assignVMToUser(userId, terminalId, ws) {
         
         // If VM is already ready, return the assignment
         // Otherwise, add this terminal to pending connections
-        if (vmReady[existingAssignment.vmId]) {
+        /*if (vmReady[existingAssignment.vmId]) {
             return existingAssignment;
         } else {
             // Add to pending connections for later
@@ -605,20 +667,36 @@ async function assignVMToUser(userId, terminalId, ws) {
             }));
             
             return null;
-        }
+        }*/
+        return existingAssignment;  // Just return the existing assignment
     }
   
-    if (isUserInCooldown(userId)) {
-        // Calculate remaining cooldown time
-        const remainingSeconds = Math.ceil((terminatedUsers.get(userId) - Date.now()) / 1000);
-        
-        // Notify client about cooldown
-        ws.send(JSON.stringify({
+    if (isUserInCooldown(userId, ws)) {
+      // Calculate remaining cooldown time
+      const expiryTime = terminatedUsers.get(userId);
+      const now = Date.now();
+      const remainingSeconds = Math.ceil((expiryTime - now) / 1000);
+      
+      // Format time for display
+      const cooldownDate = new Date(expiryTime);
+      const hours = cooldownDate.getHours().toString().padStart(2, '0');
+      const minutes = cooldownDate.getMinutes().toString().padStart(2, '0');
+      const formattedTime = `${hours}:${minutes}`;
+      
+      console.log(`User ${userId} is in cooldown for ${remainingSeconds} more seconds`);
+      
+      // Send detailed cooldown information
+      ws.send(JSON.stringify({
         type: 'error',
-        message: `Your previous session recently expired. Please wait ${remainingSeconds} seconds before starting a new session.`
-        }));
-        
-        return null;
+        message: `Your previous session recently expired. Please wait ${remainingSeconds} seconds before starting a new session.`,
+        cooldown: {
+          expiryTimestamp: expiryTime,
+          formattedTime: formattedTime,
+          reason: 'cooldown'
+        }
+      }));
+      
+      return;
     }
   
   // Find available VM in current pool
@@ -647,19 +725,24 @@ async function assignVMToUser(userId, terminalId, ws) {
     return null;
   }
   
-  // Create a pending request entry
+  // IMPORTANT: Create a pending request entry BEFORE sending NATS request
+  console.log(`Creating pending VM request for user ${userId} before NATS request`);
   pendingVMRequests.set(userId, {
     requestedAt: Date.now(),
     terminals: new Set([terminalId]),
     pendingConnections: new Map([[terminalId, ws]])
   });
-  
+
+  // Log that we've added this to pending requests
+  console.log(`Added ${userId} to pendingVMRequests, size now: ${pendingVMRequests.size}`);
+  console.log(`Pending requests now contains: ${Array.from(pendingVMRequests.keys()).join(', ')}`);
+
   // Notify client that VM is being created
   ws.send(JSON.stringify({
     type: 'vm_creating',
     message: 'Your environment is being created. Please wait...'
   }));
-  
+
   console.log(`No VM available, will request one via NATS for user ${userId}`);
   console.log(`NATS connection status:`, natsConnection ? 'Connected' : 'Not connected');  
 
@@ -683,7 +766,7 @@ async function assignVMToUser(userId, terminalId, ws) {
   } catch (error) {
     console.error(`Error requesting VM creation for user ${userId}:`, error);
     
-    // Clean up pending request on error
+    // Clean up pending request on error - still keep this cleanup
     pendingVMRequests.delete(userId);
     
     // Notify client of error
@@ -744,6 +827,38 @@ wss.on('connection', (ws, req) => {
         // Handle authentication
         if (data.type === 'auth') {
           try {
+              // First thing, log all current pending VM requests
+              console.log(`AUTH received for user ${userId}, pending VM requests:`, Array.from(pendingVMRequests.keys()));
+              console.log(`Does pendingVMRequests have ${userId}?`, pendingVMRequests.has(userId));
+              
+              // Log the exact userId type and value for better debugging
+              console.log(`User ID type: ${typeof userId}, value: "${userId}"`);
+
+              // First check if this user already has a VM being created
+              if (pendingVMRequests.has(userId)) {
+                console.log(`Found pending VM request for user ${userId}`);
+        
+                // Log the contents of the pending request
+                const pendingRequest = pendingVMRequests.get(userId);
+                console.log(`Pending request details:`, {
+                    requestedAt: new Date(pendingRequest.requestedAt).toISOString(),
+                    terminalCount: pendingRequest.terminals.size,
+                    pendingConnections: pendingRequest.pendingConnections.size
+                });
+                
+                // Add this terminal to the waiting list
+                pendingRequest.terminals.add(terminalId);
+                pendingRequest.pendingConnections.set(terminalId, ws);
+                
+                // Notify the client that VM creation is in progress
+                ws.send(JSON.stringify({
+                  type: 'vm_creating',
+                  message: 'Your environment is already being created. Please wait...'
+                }));
+                
+                return; // Important: Return here to prevent creating another VM
+              }
+            
               // Check if this is a reconnection attempt from the same user with an active session
               const hasActiveSession = userSessions.has(userId);
               
@@ -755,6 +870,13 @@ wss.on('connection', (ws, req) => {
                   
                   // Add this terminal to the existing session
                   existingSession.terminals.add(terminalId);
+                  
+                  // IMPORTANT: DO NOT update the assignedAt timestamp on reconnection
+                  // This ensures the original timeout calculation remains valid
+                  // Only update it if there's no timestamp yet (shouldn't happen)
+                  if (!existingSession.assignedAt) {
+                    existingSession.assignedAt = Date.now();
+                  }
                   
                   // IMPORTANT: Notify the client that VM is ready before establishing SSH connection
                   // This allows the client to properly initialize the terminal
@@ -774,27 +896,9 @@ wss.on('connection', (ws, req) => {
               }
               
               // For users without an active session, check for cooldown
-              if (isUserInCooldown(userId)) {
-                  // Calculate remaining cooldown time
-                  const remainingSeconds = Math.ceil((terminatedUsers.get(userId) - Date.now()) / 1000);
-                  
-                  // Notify client about cooldown
-                  ws.send(JSON.stringify({
-                      type: 'error',
-                      message: `Your previous session recently expired. Please wait ${remainingSeconds} seconds before starting a new session.`
-                  }));
-                  
+              if (isUserInCooldown(userId, ws)) {
                   return;
               }
-              
-              // Remove this redundant check - you've already checked hasActiveSession above
-              // if (userSessions.has(userId)) {
-              //     ws.send(JSON.stringify({
-              //     type: 'error',
-              //     message: 'You already have an active VM session. Please use that session or terminate it first.'
-              //     }));
-              //     return;
-              // }
       
               // Assign a VM for this user
               const assignment = await assignVMToUser(userId, terminalId, ws);
@@ -872,7 +976,7 @@ wss.on('connection', (ws, req) => {
   // Handle client disconnect
   ws.on('close', () => {
     console.log(`Terminal ${terminalId} from user ${userId} disconnected`);
-    
+  
     // Close SSH connection if exists
     if (ws.stream) {
       try {
@@ -892,42 +996,37 @@ wss.on('connection', (ws, req) => {
     
     // Check if there's a pending VM request for this user
     if (pendingVMRequests.has(userId)) {
+      console.log(`User ${userId} disconnected with pending VM request`);
       const pendingRequest = pendingVMRequests.get(userId);
       pendingRequest.terminals.delete(terminalId);
       pendingRequest.pendingConnections.delete(terminalId);
       
-      // If no more terminals are waiting, cancel the VM request
+      // Log the pending request status
+      console.log(`Pending request now has ${pendingRequest.terminals.size} terminals`);
+      
+      // If no more terminals are waiting, DON'T delete the request immediately
+      // Keep it for a short time in case of a page reload
       if (pendingRequest.terminals.size === 0) {
-        console.log(`No more terminals waiting for VM, canceling request for user ${userId}`);
-        pendingVMRequests.delete(userId);
+        console.log(`No more terminals waiting for VM for user ${userId}, but keeping request for 10 seconds`);
         
-        // Optionally notify VM service to cancel creation if possible
-        if (natsConnection) {
-          try {
-            // Use request-reply pattern for VM cancel as well
-            const requestId = uuidv4();
-            natsConnection.request(
-              'vm.cancel', 
-              sc.encode(JSON.stringify({
-                requestId: requestId,
-                userId: userId,
-                timestamp: Date.now()
-              })), 
-              { timeout: 5000 }
-            ).then(reply => {
-              const response = JSON.parse(sc.decode(reply.data));
-              console.log(`VM cancel request acknowledged: ${JSON.stringify(response)}`);
-            }).catch(err => {
-              console.error(`Error in VM cancel request:`, err);
-            });
-          } catch (e) {
-            console.error('Error initiating cancel message:', e);
+        // Set a timeout to clean up the request after a delay (to handle page reloads)
+        setTimeout(() => {
+          // Check again if still empty
+          if (pendingVMRequests.has(userId)) {
+            const request = pendingVMRequests.get(userId);
+            if (request.terminals.size === 0) {
+              console.log(`Cleaning up pending VM request for ${userId} after delay`);
+              pendingVMRequests.delete(userId);
+              
+              // Optionally notify VM service to cancel creation if possible
+              // Your existing cancel code...
+            }
           }
-        }
+        }, 10000); // 10 second delay
       }
       return;
     }
-    
+
     // If not pending, check active sessions
     const assignment = userSessions.get(userId);
     if (assignment) {
@@ -1072,8 +1171,8 @@ setInterval(() => {
   // Users in cooldown
   if (terminatedUsers.size > 0) {
     console.log(`\nUsers in Cooldown:`);
-    terminatedUsers.forEach((expiresAt, userId) => {
-      const cooldownLeft = Math.floor((expiresAt - now) / 1000);
+    terminatedUsers.forEach((expiryTime, userId) => {
+      const cooldownLeft = Math.floor((expiryTime - now) / 1000);
       console.log(`- User ${userId}: ${cooldownLeft}s remaining`);
     });
   }
