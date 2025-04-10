@@ -438,13 +438,14 @@ function checkEnvironmentTimeout() {
                   console.log(`Sending environment_terminated to ${ws.userId} with cooldown until ${formattedTime}`);
                   
                   // When terminating an environment
+                  const userCooldown = terminatedUsers.get(userId);
                   ws.send(JSON.stringify({
                     type: 'environment_terminated',
                     message: 'Environment session expired.',
                     vmId: vmToDelete.id,
                     cooldown: {
-                      expiryTimestamp: expiryTime,
-                      formattedTime: formattedTime,
+                      expiryTimestamp: userCooldown.expiryTime,
+                      formattedTime: userCooldown.formattedTime,
                       reason: 'session_timeout'
                     }
                   }));
@@ -480,36 +481,33 @@ function checkEnvironmentTimeout() {
 // Function to add a user to the cooldown list
 function addUserToCooldown(userId) {
   const expiryTime = Date.now() + USER_COOLDOWN_DURATION;
-  terminatedUsers.set(userId, expiryTime);
-  console.log(`Added user ${userId} to cooldown until ${new Date(expiryTime).toISOString()}`);
+  
+  // Format time as HH:MM
+  const expiryDate = new Date(expiryTime);
+  const hours = expiryDate.getHours().toString().padStart(2, '0');
+  const minutes = expiryDate.getMinutes().toString().padStart(2, '0');
+  const formattedTime = `${hours}:${minutes}`;
+  
+  // Store both the raw timestamp and formatted time
+  terminatedUsers.set(userId, {
+    expiryTime: expiryTime,
+    formattedTime: formattedTime
+  });
+  
+  console.log(`Added user ${userId} to cooldown until ${formattedTime} (${new Date(expiryTime).toISOString()})`);
 }
 
 // Function to check if a user is in cooldown
-// Function to check if a user is in cooldown
 function isUserInCooldown(userId, ws) {
   if (terminatedUsers.has(userId)) {
-    const expiresAt = terminatedUsers.get(userId);
+    const cooldownData = terminatedUsers.get(userId);
     const now = Date.now();
     
-    if (now < expiresAt) {
+    if (now < cooldownData.expiryTime) {
       // Still in cooldown
-      // Calculate remainingTime - THIS WAS MISSING OR INCORRECTLY PLACED
-      const remainingTime = Math.ceil((expiresAt - now) / 1000);
+      const remainingTime = Math.ceil((cooldownData.expiryTime - now) / 1000);
       
-      // Calculate a rounded-up expiry time for display
-      const displayExpiryTime = new Date(expiresAt);
-      // Round to next minute if there are seconds
-      if (displayExpiryTime.getSeconds() > 0) {
-        displayExpiryTime.setMinutes(displayExpiryTime.getMinutes() + 1);
-        displayExpiryTime.setSeconds(0);
-      }
-      
-      // Format time as HH:MM
-      const hours = displayExpiryTime.getHours().toString().padStart(2, '0');
-      const minutes = displayExpiryTime.getMinutes().toString().padStart(2, '0');
-      const formattedTime = `${hours}:${minutes}`;
-      
-      console.log(`User ${userId} is in cooldown for ${remainingTime} more seconds`);
+      console.log(`User ${userId} is in cooldown for ${remainingTime} more seconds, until ${cooldownData.formattedTime}`);
       
       // Only send a message if ws is provided and open
       if (ws && ws.readyState === WebSocket.OPEN) {
@@ -517,8 +515,9 @@ function isUserInCooldown(userId, ws) {
           type: 'error',
           message: `Your previous session recently expired. Please wait ${remainingTime} seconds before starting a new session.`,
           cooldown: {
-            expiryTimestamp: expiresAt,
-            formattedTime: formattedTime
+            expiryTimestamp: cooldownData.expiryTime,
+            formattedTime: cooldownData.formattedTime,
+            reason: 'cooldown'
           }
         }));
       }
@@ -810,6 +809,31 @@ wss.on('connection', (ws, req) => {
     ws.close();
     return;
   }
+
+  // Check for cooldown immediately, before proceeding with connection
+  if (terminatedUsers.has(userId)) {
+    const cooldownData = terminatedUsers.get(userId);
+    const now = Date.now();
+    
+    if (now < cooldownData.expiryTime) {
+      // User is in cooldown - send the cooldown message and don't proceed with connection
+      console.log(`Connection attempt from user ${userId} during cooldown until ${cooldownData.formattedTime}`);
+      
+      ws.send(JSON.stringify({
+        type: 'error',
+        message: `Your previous session has expired. You could request a new session at ${cooldownData.formattedTime}.`,
+        cooldown: {
+          expiryTimestamp: cooldownData.expiryTime,
+          formattedTime: cooldownData.formattedTime,
+          reason: 'cooldown'
+        }
+      }));
+      
+      // Do NOT proceed with normal terminal setup or VM connection
+      return;
+    }
+  }
+
   // Terminal ID is unique per terminal tab
   const terminalId = urlParams.get('terminalid') || `terminal_${Date.now()}_${Math.random().toString(36).substring(2, 15)}`;
   
@@ -827,6 +851,30 @@ wss.on('connection', (ws, req) => {
         // Handle authentication
         if (data.type === 'auth') {
           try {
+              // CRITICAL: Check for cooldown state BEFORE attempting to connect
+              if (terminatedUsers.has(userId)) {
+                const cooldownData = terminatedUsers.get(userId);
+                const now = Date.now();
+                
+                if (now < cooldownData.expiryTime) {
+                  // User is in cooldown - send cooldown message and do NOT proceed with connection
+                  console.log(`Auth attempt from user ${userId} during cooldown until ${cooldownData.formattedTime}`);
+                  
+                  ws.send(JSON.stringify({
+                    type: 'error',
+                    message: `Your previous session has expired. A new session will be available at ${cooldownData.formattedTime}.`,
+                    cooldown: {
+                      expiryTimestamp: cooldownData.expiryTime,
+                      formattedTime: cooldownData.formattedTime,
+                      reason: 'cooldown'
+                    }
+                  }));
+                  
+                  // Do NOT proceed with VM assignment or connection
+                  return;
+                }
+              }
+
               // First thing, log all current pending VM requests
               console.log(`AUTH received for user ${userId}, pending VM requests:`, Array.from(pendingVMRequests.keys()));
               console.log(`Does pendingVMRequests have ${userId}?`, pendingVMRequests.has(userId));
