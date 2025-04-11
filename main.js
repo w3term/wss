@@ -1,30 +1,18 @@
 const WebSocket = require('ws');
 const { Client } = require('ssh2');
 const fs = require('fs');
-const path = require('path');
-const jwt = require('jsonwebtoken');
 const { connect, StringCodec } = require('nats');
 const { v4: uuidv4 } = require('uuid');
 require('dotenv').config();
-
-// Session timeout mechanism with environment removal notification
-const ENV_SESSION_DURATION = parseInt(process.env.ENV_SESSION_DURATION || '60000'); // 1 minute by default for testing
-const ENV_CHECK_INTERVAL = 30000; // Check every 30 seconds
-
-// Cooldown configuration
-const USER_COOLDOWN_DURATION = parseInt(process.env.USER_COOLDOWN_DURATION || '300000'); // 5 minutes by default
 
 // NATS connection configuration
 const NATS_URL = process.env.NATS_URL || 'nats://localhost:4222';
 let natsConnection = null;
 const sc = StringCodec();
 
-// Track list of VMs
-let vmPool = [];
-const userSessions = new Map();
-const pendingVMRequests = new Map();
-const pendingVMDeletions = new Map();
-const terminatedUsers = new Map();
+// Connection tracking - only track what the WebSocket server needs to know
+const activeTerminals = new Map(); // Map of terminalId -> { ws, sshClient, stream }
+const userTerminals = new Map();   // Map of userId -> Set of terminalIds
 
 // Connect to NATS
 async function connectToNATS() {
@@ -32,177 +20,106 @@ async function connectToNATS() {
     natsConnection = await connect({ servers: NATS_URL });
     console.log(`Connected to NATS server at ${NATS_URL}`);
     
-    // Subscribe to VM creation messages
-    const subscription = natsConnection.subscribe('vm.created');
-    console.log('Subscribed to vm.created channel');
-    
-    // Subscribe to VM creation error messages
-    const errorSubscription = natsConnection.subscribe('vm.creation.error');
-    console.log('Subscribed to vm.creation.error channel');
-    
-    // Subscribe to VM deletion responses - Add for Issue 1
-    const deletionResponseSubscription = natsConnection.subscribe('vm.deletion.response');
-    console.log('Subscribed to vm.deletion.response channel');
-    
-    // Process VM creation messages in a separate function
-    processVMCreationMessages(subscription);
-    
-    // Process VM creation error messages in a separate function
-    processVMCreationErrorMessages(errorSubscription);
-    
-    // Process VM deletion responses - Add for Issue 1
-    processVMDeletionResponses(deletionResponseSubscription);
+    // Subscribe to VM-related notifications
+    subscribeToNotifications();
     
   } catch (error) {
     console.error('Error connecting to NATS:', error);
-    // Retry connection after delay
-    setTimeout(connectToNATS, 5000);
+    setTimeout(connectToNATS, 5000); // Retry connection after delay
   }
 }
 
-// Process VM creation messages
-async function processVMCreationMessages(subscription) {
+// Subscribe to necessary NATS subjects for notifications
+async function subscribeToNotifications() {
+  // VM creation completed notification
+  const vmCreatedSub = natsConnection.subscribe('vm.created');
+  processVMCreatedNotifications(vmCreatedSub);
+  
+  // VM session expired notification
+  const vmExpiringSub = natsConnection.subscribe('vm.expiring');
+  processVMExpiringNotifications(vmExpiringSub);
+}
+
+// Process VM created notifications
+async function processVMCreatedNotifications(subscription) {
   for await (const msg of subscription) {
     try {
       const vmData = JSON.parse(sc.decode(msg.data));
-      console.log(`Received VM creation notification for: ${vmData.id}`);
+      console.log(`Received VM creation notification for user: ${vmData.userId}`);
       
-      // Add the VM to our pool
-      handleVMCreated(vmData);
-    } catch (error) {
-      console.error('Error processing vm.created message:', error);
-    }
-  }
-}
-
-// Process VM creation error messages
-async function processVMCreationErrorMessages(subscription) {
-  for await (const msg of subscription) {
-    try {
-      const errorData = JSON.parse(sc.decode(msg.data));
-      console.log(`Received VM creation error for request ID: ${errorData.request_id}`);
-      
-      // Handle VM creation error
-      handleVMCreationError(errorData);
-    } catch (error) {
-      console.error('Error processing vm.creation.error message:', error);
-    }
-  }
-}
-
-// Process VM deletion responses - Add for Issue 1
-async function processVMDeletionResponses(subscription) {
-  for await (const msg of subscription) {
-    try {
-      const response = JSON.parse(sc.decode(msg.data));
-      console.log(`Received VM deletion response for request ID: ${response.request_id}, status: ${response.status}`);
-      
-      // Check if we have a pending deletion request with this ID
-      if (pendingVMDeletions.has(response.request_id)) {
-        const deletion = pendingVMDeletions.get(response.request_id);
+      // Find all terminals for this user and establish SSH connections
+      if (userTerminals.has(vmData.userId)) {
+        const terminals = userTerminals.get(vmData.userId);
         
-        if (response.status === 'success') {
-          console.log(`VM ${deletion.vmId} successfully deleted by deletion service`);
-        } else {
-          console.error(`VM deletion failed for ${deletion.vmId}: ${response.error || 'unknown error'}`);
-        }
-        
-        // Cleanup the pending deletion request
-        pendingVMDeletions.delete(response.request_id);
-      } else {
-        console.log(`Received deletion response for unknown request: ${response.request_id}`);
-      }
-    } catch (error) {
-      console.error('Error processing vm.deletion.response message:', error);
-    }
-  }
-}
-
-// Handle VM created message
-function handleVMCreated(vmData) {
-  // Add VM to pool
-  vmPool.push(vmData);
-  
-  // Check if we have pending requests for this VM
-  const userId = vmData.userId;
-  
-  if (userId && pendingVMRequests.has(userId)) {
-    const pendingRequest = pendingVMRequests.get(userId);
-    pendingVMRequests.delete(userId);
-    
-    // Create user session assignment
-    userSessions.set(userId, {
-      vmId: vmData.id,
-      vmIp: vmData.ip,
-      assignedAt: Date.now(),
-      terminals: new Set(pendingRequest.terminals)
-    });
-    
-    console.log(`VM ${vmData.id} (${vmData.ip}) is now ready for user ${userId}`);
-    
-    // Notify clients that VM is ready
-    wss.clients.forEach((ws) => {
-      if (ws.userId === userId) {
-        try {
-          ws.send(JSON.stringify({
-            type: 'vm_ready',
-            message: 'Your environment is ready',
-            vmId: vmData.id
-          }));
-          
-          // If this client has a pending SSH connection, establish it now
-          if (pendingRequest.pendingConnections.has(ws.terminalId)) {
-            establishSSHConnection(ws, vmData.ip);
-            pendingRequest.pendingConnections.delete(ws.terminalId);
+        for (const terminalId of terminals) {
+          const terminalData = activeTerminals.get(terminalId);
+          if (terminalData && terminalData.ws.readyState === WebSocket.OPEN) {
+            // Notify client that VM is ready
+            terminalData.ws.send(JSON.stringify({
+              type: 'vm_ready',
+              message: 'Your environment is ready',
+              vmId: vmData.vmId,
+              ip: vmData.ip
+            }));
+            
+            // Establish SSH connection
+            establishSSHConnection(terminalData.ws, vmData.ip);
           }
-        } catch (error) {
-          console.error('Error sending VM ready message:', error);
         }
       }
-    });
+    } catch (error) {
+      console.error('Error processing vm.created notification:', error);
+    }
   }
 }
 
-// Handle VM creation error messages
-function handleVMCreationError(errorData) {
-  // Try to find the affected user session
-  const requestId = errorData.request_id;
-  let affectedUserId = null;
-  
-  // Check if we can find a user ID with a pending request
-  pendingVMRequests.forEach((request, userId) => {
-    // If we find a match, notify clients
-    affectedUserId = userId;
-  });
-  
-  if (affectedUserId) {
-    const pendingRequest = pendingVMRequests.get(affectedUserId);
-    
-    // Notify all waiting terminals for this user
-    pendingRequest.pendingConnections.forEach((ws) => {
-      try {
-        ws.send(JSON.stringify({
-          type: 'error',
-          message: `VM creation failed: ${errorData.error}`,
-          details: errorData
-        }));
-      } catch (error) {
-        console.error('Error sending creation error message:', error);
+// Process VM expiring notifications
+async function processVMExpiringNotifications(subscription) {
+  for await (const msg of subscription) {
+    try {
+      const expData = JSON.parse(sc.decode(msg.data));
+      console.log(`Received VM expiring notification for user: ${expData.userId}`);
+      
+      // Send timeout notification to all of user's terminals
+      if (userTerminals.has(expData.userId)) {
+        const terminals = userTerminals.get(expData.userId);
+        const expiryReplyData = { acknowledged: true };
+        
+        for (const terminalId of terminals) {
+          const terminalData = activeTerminals.get(terminalId);
+          if (terminalData && terminalData.ws.readyState === WebSocket.OPEN) {
+            // Send session expiration message to client
+            terminalData.ws.send(JSON.stringify({
+              type: 'environment_terminated',
+              message: 'Your session has expired.',
+              reason: expData.reason,
+              cooldown: expData.cooldown
+            }));
+            
+            // Close the SSH connection and WebSocket
+            closeTerminalConnection(terminalId);
+          }
+        }
+        
+        // Reply to the request to acknowledge the expiration
+        if (msg.reply) {
+          msg.respond(sc.encode(JSON.stringify(expiryReplyData)));
+        }
       }
-    });
-    
-    // Clean up the pending request
-    pendingVMRequests.delete(affectedUserId);
-    console.log(`Cleaned up pending VM request for user ${affectedUserId} due to creation error`);
-  } else {
-    console.log(`Received VM creation error but couldn't match to pending request: ${JSON.stringify(errorData)}`);
+    } catch (error) {
+      console.error('Error processing vm.expiring notification:', error);
+      // Still respond with acknowledgment to prevent blockage
+      if (msg.reply) {
+        msg.respond(sc.encode(JSON.stringify({ acknowledged: true, error: error.message })));
+      }
+    }
   }
 }
 
-// Establish SSH connection
+// Establish SSH connection to a VM
 function establishSSHConnection(ws, vmIp) {
   // Configuration
-  const MAX_RETRIES = 10;
+  const MAX_RETRIES = 3;
   const INITIAL_RETRY_DELAY = 3000; // 3 seconds
   const MAX_RETRY_DELAY = 15000; // 15 seconds
   
@@ -220,9 +137,6 @@ function establishSSHConnection(ws, vmIp) {
     // Connect to the VM
     console.log(`SSH connection attempt ${currentRetry + 1}/${MAX_RETRIES} for terminal ${ws.terminalId} to VM at ${vmIp}`);
     
-    // Log SSH connection details (without sensitive info)
-    console.log(`SSH connection details: host=${vmIp}, port=${parseInt(process.env.SSH_PORT || '22')}, username=${process.env.VM_USER}`);
-    
     // Add timeout for connection
     const sshTimeout = setTimeout(() => {
       console.error(`SSH connection timed out for ${ws.terminalId} to ${vmIp}`);
@@ -238,15 +152,15 @@ function establishSSHConnection(ws, vmIp) {
       
       // Request a PTY (pseudo-terminal) with specific size
       ssh.shell({ 
-            term: 'xterm-256color',
-            rows: 24,
-            cols: 120, // Increased columns
-            modes: {
-                ECHO: 1,          // Enable echo
-                ICANON: 1,        // Enable canonical mode (line buffering)
-                ISIG: 1           // Enable signals
-            }
-        }, (err, shellStream) => {
+        term: 'xterm-256color',
+        rows: 24,
+        cols: 120,
+        modes: {
+          ECHO: 1,
+          ICANON: 1,
+          ISIG: 1
+        }
+      }, (err, shellStream) => {
         if (err) {
           console.error(`Failed to open shell on ${vmIp}: ${err.message}`);
           ws.send(JSON.stringify({ type: 'error', message: `Failed to open shell: ${err.message}` }));
@@ -256,37 +170,17 @@ function establishSSHConnection(ws, vmIp) {
         stream = shellStream;
         ws.stream = stream;
         
-        // Add a buffer for the initial output to prevent duplicate prompts
-        let initialOutputBuffer = '';
-        let initialOutputComplete = false;
-        
-        // Send raw SSH output directly to client
+        // Send SSH output to client
         stream.on('data', (data) => {
           const dataStr = data.toString('utf-8');
-          
-          // Only buffer the first prompt
-          if (!initialOutputComplete) {
-            initialOutputBuffer += dataStr;
-            
-            // If we detect a shell prompt, consider initialization complete
-            if (initialOutputBuffer.includes('$') || initialOutputBuffer.includes('#') || initialOutputBuffer.includes('>')) {
-              initialOutputComplete = true;
-              ws.send(JSON.stringify({ 
-                type: 'data', 
-                data: initialOutputBuffer
-              }));
-            }
-          } else {
-            ws.send(JSON.stringify({ 
-              type: 'data', 
-              data: dataStr
-            }));
-          }
+          ws.send(JSON.stringify({ 
+            type: 'data', 
+            data: dataStr
+          }));
         });
         
         stream.stderr.on('data', (data) => {
           const errorText = data.toString('utf-8');
-          console.error(`SSH stderr from ${vmIp}: ${errorText}`);
           ws.send(JSON.stringify({ 
             type: 'data', 
             data: errorText
@@ -310,36 +204,17 @@ function establishSSHConnection(ws, vmIp) {
       console.log(`SSH connection closed for ${vmIp} (terminal ${ws.terminalId})`);
     });
     
-    ssh.on('end', () => {
-      console.log(`SSH connection ended for ${vmIp} (terminal ${ws.terminalId})`);
-    });
-    
-    /*ssh.on('handshake', (negotiated) => {
-      //console.log(`SSH handshake completed for ${vmIp} with algorithms:`, negotiated);
-      console.log(`SSH handshake completed for ${vmIp}`);
-    });*/
-    
     try {
       ssh.connect({
         host: vmIp,
         port: parseInt(process.env.SSH_PORT || '22'),
         username: process.env.VM_USER,
         privateKey: fs.readFileSync(process.env.SSH_PRIVATE_KEY_PATH),
-        debug: process.env.SSH_DEBUG === 'true', // Enable debug output when env var is set
-        readyTimeout: 30000, // 30 second timeout
-        // Add connection parameters that might help with stability
-        keepaliveInterval: 5000, // Send keepalive every 5 seconds
-        keepaliveCountMax: 5,    // Allow 5 missed keepalives before disconnecting
-        algorithms: {
-          // Explicitly specify only the most common algorithms to avoid compatibility issues
-          kex: ['ecdh-sha2-nistp256', 'ecdh-sha2-nistp384', 'ecdh-sha2-nistp521', 'diffie-hellman-group-exchange-sha256'],
-          cipher: ['aes128-ctr', 'aes192-ctr', 'aes256-ctr'],
-          serverHostKey: ['ssh-rsa', 'ecdsa-sha2-nistp256', 'ssh-ed25519'],
-          hmac: ['hmac-sha2-256', 'hmac-sha2-512']
-        }
+        readyTimeout: 30000,
+        keepaliveInterval: 5000,
+        keepaliveCountMax: 5
       });
     } catch (err) {
-      // Handle any synchronous exceptions during connection setup
       clearTimeout(sshTimeout);
       handleConnectionFailure(err, ssh);
     }
@@ -347,16 +222,7 @@ function establishSSHConnection(ws, vmIp) {
   
   // Function to handle connection failures and retry if appropriate
   function handleConnectionFailure(err, ssh) {
-    const errorDetails = {
-      message: err.message,
-      code: err.code,
-      level: err.level,
-      syscall: err.syscall,
-      errno: err.errno
-    };
-    
     console.error(`SSH connection error for ${vmIp} (terminal ${ws.terminalId}): ${err.message}`);
-    console.error(`Error details:`, errorDetails);
     
     // Close failed connection
     try {
@@ -381,16 +247,13 @@ function establishSSHConnection(ws, vmIp) {
       // Exponential backoff for next retry
       setTimeout(() => {
         attemptSSHConnection();
-        
-        // Increase delay for next retry (with a cap)
         retryDelay = Math.min(retryDelay * 1.5, MAX_RETRY_DELAY);
       }, retryDelay);
     } else {
       // No more retries, send final error to client
       ws.send(JSON.stringify({ 
         type: 'error', 
-        message: `SSH connection failed after ${MAX_RETRIES} attempts: ${err.message}`,
-        details: errorDetails
+        message: `SSH connection failed after ${MAX_RETRIES} attempts: ${err.message}`
       }));
       
       ws.close();
@@ -401,405 +264,57 @@ function establishSSHConnection(ws, vmIp) {
   attemptSSHConnection();
 }
 
-// Function to trigger environment timeouts
-function checkEnvironmentTimeout() {
-  const now = Date.now();
-  console.log(`Running environment timeout check at ${new Date(now).toISOString()}`);
+// Close a terminal connection properly
+function closeTerminalConnection(terminalId) {
+  const terminalData = activeTerminals.get(terminalId);
+  if (!terminalData) return;
   
-  userSessions.forEach((assignment, userId) => {
-    const sessionDuration = now - assignment.assignedAt;
-    
-    if (sessionDuration > ENV_SESSION_DURATION) {
-      console.log(`TIMEOUT TRIGGERED for user ${userId}, session duration: ${sessionDuration}ms, threshold: ${ENV_SESSION_DURATION}ms`);
-      
-      // Find the VM in the pool
-      const vmToDelete = vmPool.find(vm => vm.id === assignment.vmId);
-      
-      if (vmToDelete) {
-        console.log(`Found VM to delete: ${vmToDelete.id}`);
-        
-        // First, close all WebSocket connections for this client
-        let closedConnections = 0;
-        wss.clients.forEach((ws) => {
-          if (ws.userId === userId) {
-            try {
-              // Try to send a termination message, but don't worry if it fails
-              if (ws.readyState === WebSocket.OPEN) {
-                try {
-                  // Calculate the cooldown expiry time
-                  const expiryTime = Date.now() + USER_COOLDOWN_DURATION;
-                  const cooldownDate = new Date(expiryTime);
-                  
-                  // Format time as HH:MM
-                  const hours = cooldownDate.getHours().toString().padStart(2, '0');
-                  const minutes = cooldownDate.getMinutes().toString().padStart(2, '0');
-                  const formattedTime = `${hours}:${minutes}`;
-                  
-                  console.log(`Sending environment_terminated to ${ws.userId} with cooldown until ${formattedTime}`);
-                  
-                  // When terminating an environment
-                  const userCooldown = terminatedUsers.get(userId);
-                  ws.send(JSON.stringify({
-                    type: 'environment_terminated',
-                    message: 'Environment session expired.',
-                    vmId: vmToDelete.id,
-                    cooldown: {
-                      expiryTimestamp: userCooldown.expiryTime,
-                      formattedTime: userCooldown.formattedTime,
-                      reason: 'session_timeout'
-                    }
-                  }));
-                } catch (err) {
-                  console.error(`Error sending termination message: ${err.message}`);
-                }
-              }
-              
-              // Force close the connection
-              ws.terminate(); // Hard close, doesn't wait for close frames
-              closedConnections++;
-            } catch (error) {
-              console.error(`Error terminating WebSocket for ${ws.terminalId}:`, error);
-            }
-          }
-        });
-        
-        console.log(`Forcibly closed ${closedConnections} connections for user ${userId}`);
-        
-        // Request VM deletion via NATS
-        requestVMDeletion(vmToDelete.id, userId, 'session_timeout');
-        
-        // Add user to cooldown list
-        addUserToCooldown(userId);
-      }
-      
-      // Release the VM from user sessions
-      releaseVM(userId);
-    }
-  });
-}
-
-// Function to add a user to the cooldown list
-function addUserToCooldown(userId) {
-  const expiryTime = Date.now() + USER_COOLDOWN_DURATION;
-  
-  // Format time as HH:MM
-  const expiryDate = new Date(expiryTime);
-  const hours = expiryDate.getHours().toString().padStart(2, '0');
-  const minutes = expiryDate.getMinutes().toString().padStart(2, '0');
-  const formattedTime = `${hours}:${minutes}`;
-  
-  // Store both the raw timestamp and formatted time
-  terminatedUsers.set(userId, {
-    expiryTime: expiryTime,
-    formattedTime: formattedTime
-  });
-  
-  console.log(`Added user ${userId} to cooldown until ${formattedTime} (${new Date(expiryTime).toISOString()})`);
-}
-
-// Function to check if a user is in cooldown
-function isUserInCooldown(userId, ws) {
-  if (terminatedUsers.has(userId)) {
-    const cooldownData = terminatedUsers.get(userId);
-    const now = Date.now();
-    
-    if (now < cooldownData.expiryTime) {
-      // Still in cooldown
-      const remainingTime = Math.ceil((cooldownData.expiryTime - now) / 1000);
-      
-      console.log(`User ${userId} is in cooldown for ${remainingTime} more seconds, until ${cooldownData.formattedTime}`);
-      
-      // Only send a message if ws is provided and open
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({
-          type: 'error',
-          message: `Your previous session recently expired. Please wait ${remainingTime} seconds before starting a new session.`,
-          cooldown: {
-            expiryTimestamp: cooldownData.expiryTime,
-            formattedTime: cooldownData.formattedTime,
-            reason: 'cooldown'
-          }
-        }));
-      }
-      
-      return true;
-    } else {
-      // Cooldown expired, remove from map
-      terminatedUsers.delete(userId);
-      console.log(`User ${userId} cooldown expired, removed from restrictions`);
-      return false;
+  // Close SSH stream if it exists
+  if (terminalData.stream) {
+    try {
+      terminalData.stream.close();
+    } catch (e) {
+      console.error(`Error closing stream for terminal ${terminalId}:`, e);
     }
   }
-  return false;
-}
-
-// Modified: Function to request VM deletion via NATS with request-reply pattern
-async function requestVMDeletion(vmId, userId, reason) {
-  if (!natsConnection) {
-    console.error('Cannot request VM deletion: NATS connection not available');
-    return;
-  }
   
-  try {
-    // Generate a unique request ID for tracking
-    const requestId = uuidv4();
-    
-    // Store deletion request in pending map
-    pendingVMDeletions.set(requestId, {
-      vmId,
-      userId,
-      reason,
-      requestedAt: Date.now()
-    });
-    
-    // Use request-reply pattern instead of simple publish - Issue 1 fix
-    const reply = await natsConnection.request(
-      'vm.delete',
-      sc.encode(JSON.stringify({
-        requestId: requestId,
-        vmId: vmId,
-        userId: userId,
-        reason: reason,
-        timestamp: Date.now()
-      })),
-      { timeout: 10000 } // 10 second timeout for reply
-    );
-    
-    // Process the immediate acknowledgment
-    const response = JSON.parse(sc.decode(reply.data));
-    console.log(`VM deletion request for ${vmId} acknowledged: ${JSON.stringify(response)}`);
-    
-    // Remove VM from local pool
-    const vmIndex = vmPool.findIndex(vm => vm.id === vmId);
-    if (vmIndex !== -1) {
-      vmPool.splice(vmIndex, 1);
-      console.log(`Removed VM ${vmId} from local pool`);
-    }
-  } catch (error) {
-    console.error(`Error requesting VM deletion for ${vmId}:`, error);
-    
-    // Check if we need to clean up from pendingVMDeletions
-    // (We'll find by vmId since requestId might not be accessible in this catch block)
-    for (const [requestId, details] of pendingVMDeletions.entries()) {
-      if (details.vmId === vmId) {
-        pendingVMDeletions.delete(requestId);
-        console.log(`Cleaned up pending VM deletion for ${vmId} due to request error`);
-      }
+  // Close SSH connection if it exists
+  if (terminalData.ssh) {
+    try {
+      terminalData.ssh.end();
+    } catch (e) {
+      console.error(`Error ending SSH connection for terminal ${terminalId}:`, e);
     }
   }
-}
-
-// Periodically clean up expired cooldowns - Part of Issue 2 solution
-setInterval(() => {
-  const now = Date.now();
-  let expiredCount = 0;
   
-  terminatedUsers.forEach((expiryTime, userId) => {
-    if (now >= expiryTime) {
-      terminatedUsers.delete(userId);
-      expiredCount++;
+  // Close WebSocket if it's open
+  if (terminalData.ws && terminalData.ws.readyState === WebSocket.OPEN) {
+    try {
+      terminalData.ws.close();
+    } catch (e) {
+      console.error(`Error closing WebSocket for terminal ${terminalId}:`, e);
     }
-  });
-  
-  if (expiredCount > 0) {
-    console.log(`Cleaned up ${expiredCount} expired user cooldowns`);
-  }
-}, 60000); // Check every minute
-
-// Start the environment timeout check interval
-const environmentTimeoutInterval = setInterval(checkEnvironmentTimeout, ENV_CHECK_INTERVAL);
-
-// Optional: Cleanup interval on server shutdown
-process.on('SIGINT', async () => {
-  clearInterval(environmentTimeoutInterval);
-  console.log('Environment timeout checker stopped');
-  
-  if (natsConnection) {
-    await natsConnection.drain();
-    console.log('NATS connection drained');
   }
   
-  process.exit(0);
-});
-
-// Function to assign a VM to a user session
-async function assignVMToUser(userId, terminalId, ws) {
-    // Check for pending VM request first
-    if (pendingVMRequests.has(userId)) {
-      console.log(`User ${userId} already has a pending VM request, connecting to existing request`);
-      
-      const pendingRequest = pendingVMRequests.get(userId);
-      pendingRequest.terminals.add(terminalId);
-      pendingRequest.pendingConnections.set(terminalId, ws);
-      
-      // Notify client that VM is being created
-      ws.send(JSON.stringify({
-        type: 'vm_creating',
-        message: 'Your environment is already being created. Please wait...'
-      }));
-      
-      return null;
+  // Remove terminal from tracking
+  activeTerminals.delete(terminalId);
+  
+  // Remove from user's terminals if possible
+  if (terminalData.userId && userTerminals.has(terminalData.userId)) {
+    const userTerminalSet = userTerminals.get(terminalData.userId);
+    userTerminalSet.delete(terminalId);
+    
+    // If user has no more terminals, remove the user entry
+    if (userTerminalSet.size === 0) {
+      userTerminals.delete(terminalData.userId);
     }
-
-    // Check for existing assignment first
-    if (userSessions.has(userId)) {
-        const existingAssignment = userSessions.get(userId);
-        
-        // Add this terminal to the existing session
-        existingAssignment.terminals.add(terminalId);
-        
-        // If VM is already ready, return the assignment
-        // Otherwise, add this terminal to pending connections
-        /*if (vmReady[existingAssignment.vmId]) {
-            return existingAssignment;
-        } else {
-            // Add to pending connections for later
-            if (pendingVMRequests.has(userId)) {
-                const pendingRequest = pendingVMRequests.get(userId);
-                pendingRequest.pendingConnections.set(terminalId, ws);
-            }
-            
-            // Let client know we're still waiting for VM
-            ws.send(JSON.stringify({
-                type: 'vm_creating',
-                message: 'Your environment is being created. Please wait...'
-            }));
-            
-            return null;
-        }*/
-        return existingAssignment;  // Just return the existing assignment
-    }
-  
-    if (isUserInCooldown(userId, ws)) {
-      // Calculate remaining cooldown time
-      const expiryTime = terminatedUsers.get(userId);
-      const now = Date.now();
-      const remainingSeconds = Math.ceil((expiryTime - now) / 1000);
-      
-      // Format time for display
-      const cooldownDate = new Date(expiryTime);
-      const hours = cooldownDate.getHours().toString().padStart(2, '0');
-      const minutes = cooldownDate.getMinutes().toString().padStart(2, '0');
-      const formattedTime = `${hours}:${minutes}`;
-      
-      console.log(`User ${userId} is in cooldown for ${remainingSeconds} more seconds`);
-      
-      // Send detailed cooldown information
-      ws.send(JSON.stringify({
-        type: 'error',
-        message: `Your previous session recently expired. Please wait ${remainingSeconds} seconds before starting a new session.`,
-        cooldown: {
-          expiryTimestamp: expiryTime,
-          formattedTime: formattedTime,
-          reason: 'cooldown'
-        }
-      }));
-      
-      return;
-    }
-  
-  // Find available VM in current pool
-  const availableVM = vmPool.find(vm => !vm.busy);
-  
-  if (availableVM) {
-    // Mark VM as busy
-    availableVM.busy = true;
-    availableVM.userId = userId;
-    
-    // Create user session
-    userSessions.set(userId, {
-      vmId: availableVM.id,
-      vmIp: availableVM.ip,
-      assignedAt: Date.now(),
-      terminals: new Set([terminalId])
-    });
-    
-    console.log(`Assigned existing VM ${availableVM.id} (${availableVM.ip}) to user ${userId}`);
-    return userSessions.get(userId);
   }
-  
-  // No existing VM available, request new one via NATS
-  if (!natsConnection) {
-    console.error('Cannot request VM creation: NATS connection not available');
-    return null;
-  }
-  
-  // IMPORTANT: Create a pending request entry BEFORE sending NATS request
-  console.log(`Creating pending VM request for user ${userId} before NATS request`);
-  pendingVMRequests.set(userId, {
-    requestedAt: Date.now(),
-    terminals: new Set([terminalId]),
-    pendingConnections: new Map([[terminalId, ws]])
-  });
-
-  // Log that we've added this to pending requests
-  console.log(`Added ${userId} to pendingVMRequests, size now: ${pendingVMRequests.size}`);
-  console.log(`Pending requests now contains: ${Array.from(pendingVMRequests.keys()).join(', ')}`);
-
-  // Notify client that VM is being created
-  ws.send(JSON.stringify({
-    type: 'vm_creating',
-    message: 'Your environment is being created. Please wait...'
-  }));
-
-  console.log(`No VM available, will request one via NATS for user ${userId}`);
-  console.log(`NATS connection status:`, natsConnection ? 'Connected' : 'Not connected');  
-
-  // Request VM creation
-  try {
-    // Generate a unique request ID for this VM creation
-    const requestId = uuidv4();
-    
-    // Send request-reply message
-    const reply = await natsConnection.request('vm.create', sc.encode(JSON.stringify({
-      requestId: requestId,
-      userId: userId,
-      requestedAt: Date.now()
-    })), { timeout: 10000 });
-    
-    const response = JSON.parse(sc.decode(reply.data));
-    console.log(`VM creation request acknowledged: ${JSON.stringify(response)}`);
-    
-    // The actual VM details will come later on the vm.created subscription
-    return null;
-  } catch (error) {
-    console.error(`Error requesting VM creation for user ${userId}:`, error);
-    
-    // Clean up pending request on error - still keep this cleanup
-    pendingVMRequests.delete(userId);
-    
-    // Notify client of error
-    ws.send(JSON.stringify({
-      type: 'error',
-      message: 'Failed to create environment. Please try again later.'
-    }));
-    
-    return null;
-  }
-}
-
-// Function to release a VM when user session ends
-function releaseVM(userId) {
-  const assignment = userSessions.get(userId);
-  if (!assignment) return;
-  
-  // Find the VM in the pool
-  const vm = vmPool.find(vm => vm.id === assignment.vmId);
-  if (vm) {
-    // If VM is in our pool, mark it as no longer busy
-    vm.busy = false;
-    vm.userId = null;
-    console.log(`Released VM ${vm.id} (${vm.ip}) from user ${userId}`);
-  }
-  
-  // Remove from sessions map
-  userSessions.delete(userId);
 }
 
 // Create WebSocket server
 const wss = new WebSocket.Server({ port: process.env.WS_PORT || 8081 });
 
-wss.on('connection', (ws, req) => {
+wss.on('connection', async (ws, req) => {
   // Parse query parameters
   const urlParams = new URL(`http://localhost${req.url}`).searchParams;
   
@@ -808,30 +323,6 @@ wss.on('connection', (ws, req) => {
     ws.send(JSON.stringify({ type: 'error', message: 'Authentication required' }));
     ws.close();
     return;
-  }
-
-  // Check for cooldown immediately, before proceeding with connection
-  if (terminatedUsers.has(userId)) {
-    const cooldownData = terminatedUsers.get(userId);
-    const now = Date.now();
-    
-    if (now < cooldownData.expiryTime) {
-      // User is in cooldown - send the cooldown message and don't proceed with connection
-      console.log(`Connection attempt from user ${userId} during cooldown until ${cooldownData.formattedTime}`);
-      
-      ws.send(JSON.stringify({
-        type: 'error',
-        message: `Your previous session has expired. You could request a new session at ${cooldownData.formattedTime}.`,
-        cooldown: {
-          expiryTimestamp: cooldownData.expiryTime,
-          formattedTime: cooldownData.formattedTime,
-          reason: 'cooldown'
-        }
-      }));
-      
-      // Do NOT proceed with normal terminal setup or VM connection
-      return;
-    }
   }
 
   // Terminal ID is unique per terminal tab
@@ -843,401 +334,187 @@ wss.on('connection', (ws, req) => {
   ws.userId = userId;
   ws.terminalId = terminalId;
   
+  // Track this terminal
+  activeTerminals.set(terminalId, { ws, userId, ssh: null, stream: null });
+  
+  // Add to user's terminals set
+  if (!userTerminals.has(userId)) {
+    userTerminals.set(userId, new Set());
+  }
+  userTerminals.get(userId).add(terminalId);
+  
   // Handle messages from client
   ws.on('message', async (message) => {
     try {
-        const data = JSON.parse(message);
+      const data = JSON.parse(message);
       
-        // Handle authentication
-        if (data.type === 'auth') {
-          try {
-              // CRITICAL: Check for cooldown state BEFORE attempting to connect
-              if (terminatedUsers.has(userId)) {
-                const cooldownData = terminatedUsers.get(userId);
-                const now = Date.now();
-                
-                if (now < cooldownData.expiryTime) {
-                  // User is in cooldown - send cooldown message and do NOT proceed with connection
-                  console.log(`Auth attempt from user ${userId} during cooldown until ${cooldownData.formattedTime}`);
-                  
-                  ws.send(JSON.stringify({
-                    type: 'error',
-                    message: `Your previous session has expired. A new session will be available at ${cooldownData.formattedTime}.`,
-                    cooldown: {
-                      expiryTimestamp: cooldownData.expiryTime,
-                      formattedTime: cooldownData.formattedTime,
-                      reason: 'cooldown'
-                    }
-                  }));
-                  
-                  // Do NOT proceed with VM assignment or connection
-                  return;
-                }
-              }
-
-              // First thing, log all current pending VM requests
-              console.log(`AUTH received for user ${userId}, pending VM requests:`, Array.from(pendingVMRequests.keys()));
-              console.log(`Does pendingVMRequests have ${userId}?`, pendingVMRequests.has(userId));
-              
-              // Log the exact userId type and value for better debugging
-              console.log(`User ID type: ${typeof userId}, value: "${userId}"`);
-
-              // First check if this user already has a VM being created
-              if (pendingVMRequests.has(userId)) {
-                console.log(`Found pending VM request for user ${userId}`);
+      // Handle authentication/VM session request
+      if (data.type === 'auth') {
+        // Check if user can have a VM session
+        const sessionReply = await natsConnection.request('vm.session.check', 
+          sc.encode(JSON.stringify({
+            userId: userId,
+            terminalId: terminalId
+          })),
+          { timeout: 10000 }
+        );
         
-                // Log the contents of the pending request
-                const pendingRequest = pendingVMRequests.get(userId);
-                console.log(`Pending request details:`, {
-                    requestedAt: new Date(pendingRequest.requestedAt).toISOString(),
-                    terminalCount: pendingRequest.terminals.size,
-                    pendingConnections: pendingRequest.pendingConnections.size
-                });
-                
-                // Add this terminal to the waiting list
-                pendingRequest.terminals.add(terminalId);
-                pendingRequest.pendingConnections.set(terminalId, ws);
-                
-                // Notify the client that VM creation is in progress
-                ws.send(JSON.stringify({
-                  type: 'vm_creating',
-                  message: 'Your environment is already being created. Please wait...'
-                }));
-                
-                return; // Important: Return here to prevent creating another VM
-              }
-            
-              // Check if this is a reconnection attempt from the same user with an active session
-              const hasActiveSession = userSessions.has(userId);
-              
-              if (hasActiveSession) {
-                  console.log(`User ${userId} has an active session, allowing reconnection`);
-                  
-                  // Get the existing session
-                  const existingSession = userSessions.get(userId);
-                  
-                  // Add this terminal to the existing session
-                  existingSession.terminals.add(terminalId);
-                  
-                  // IMPORTANT: DO NOT update the assignedAt timestamp on reconnection
-                  // This ensures the original timeout calculation remains valid
-                  // Only update it if there's no timestamp yet (shouldn't happen)
-                  if (!existingSession.assignedAt) {
-                    existingSession.assignedAt = Date.now();
-                  }
-                  
-                  // IMPORTANT: Notify the client that VM is ready before establishing SSH connection
-                  // This allows the client to properly initialize the terminal
-                  ws.send(JSON.stringify({
-                      type: 'vm_ready',
-                      message: 'Your environment is ready',
-                      vmId: existingSession.vmId,
-                      vmIp: existingSession.vmIp
-                  }));
-                  
-                  // Wait a brief moment then establish SSH connection
-                  setTimeout(() => {
-                      // Connect to the assigned VM
-                      establishSSHConnection(ws, existingSession.vmIp);
-                  }, 500);
-                  return;
-              }
-              
-              // For users without an active session, check for cooldown
-              if (isUserInCooldown(userId, ws)) {
-                  return;
-              }
-      
-              // Assign a VM for this user
-              const assignment = await assignVMToUser(userId, terminalId, ws);
-      
-              if (!assignment) {
-                  // This is not an error, just means VM is being created
-                  // Client has already been notified via ws.send in assignVMToUser
-                  return;
-              }
-              
-              // When a VM is newly assigned, notify the client first
-              ws.send(JSON.stringify({
-                  type: 'vm_ready',
-                  message: 'Your environment is ready',
-                  vmId: assignment.vmId,
-                  vmIp: assignment.vmIp
-              }));
-              
-              // Then connect to the assigned VM after a short delay
-              setTimeout(() => {
-                  establishSSHConnection(ws, assignment.vmIp);
-              }, 500);
-          } catch (err) {
-              ws.send(JSON.stringify({ type: 'error', message: `Authentication failed: ${err.message}` }));
-              ws.close();
-          }
-        }
-      
-        else if (data.type === 'establish_ssh') {
-            const vmId = data.vmId;
-            const session = userSessions.get(userId);
-            
-            if (session && session.vmIp) {
-                console.log(`Establishing SSH connection for user ${userId} to VM ${vmId}`);
-                establishSSHConnection(ws, session.vmIp);
-            } else {
-                ws.send(JSON.stringify({ 
-                    type: 'error', 
-                    message: 'Cannot establish SSH connection: No VM assigned' 
-                }));
-            }
-        }
-
-        else if (data.type === 'connect_ssh') {
-            const vmId = data.vmId;
-            // Find VM IP based on vmId
-            const vm = vmPool.find(vm => vm.id === vmId);
-            
-            if (vm && vm.ip) {
-                console.log(`Establishing SSH connection for user ${userId} to VM ${vmId} (${vm.ip})`);
-                establishSSHConnection(ws, vm.ip);
-            } else {
-                ws.send(JSON.stringify({ 
-                    type: 'error', 
-                    message: 'Cannot establish SSH connection: VM not found' 
-                }));
-            }
-        }
-
-        // Handle raw terminal data
-        else if (data.type === 'data' && ws.stream) {
-            ws.stream.write(data.data);
+        const sessionData = JSON.parse(sc.decode(sessionReply.data));
+        
+        if (sessionData.status === 'cooldown') {
+          // User is in cooldown period
+          ws.send(JSON.stringify({
+            type: 'error',
+            message: `Your previous session has expired. You can request a new session at ${sessionData.cooldown.formattedTime}.`,
+            cooldown: sessionData.cooldown
+          }));
+          return;
         }
         
-        // Handle terminal resize events
-        else if (data.type === 'resize' && ws.stream) {
-            ws.stream.setWindow(data.rows, data.cols, 0, 0);
+        if (sessionData.status === 'existing_session') {
+          // User has an existing session, connect to it
+          ws.send(JSON.stringify({
+            type: 'vm_ready',
+            message: 'Your environment is ready',
+            vmId: sessionData.vmId,
+            ip: sessionData.vmIp
+          }));
+          
+          // Connect to the VM
+          establishSSHConnection(ws, sessionData.vmIp);
+          return;
         }
+        
+        if (sessionData.status === 'pending') {
+          // VM is being created, notification will come later
+          ws.send(JSON.stringify({
+            type: 'vm_creating',
+            message: 'Your environment is being created. Please wait...'
+          }));
+          return;
+        }
+        
+        if (sessionData.status === 'ready') {
+          // Request granted immediately with ready VM
+          ws.send(JSON.stringify({
+            type: 'vm_ready',
+            message: 'Your environment is ready',
+            vmId: sessionData.vmId,
+            ip: sessionData.vmIp
+          }));
+          
+          // Connect to the VM
+          establishSSHConnection(ws, sessionData.vmIp);
+          return;
+        }
+        
+        // Request a new VM
+        const vmReply = await natsConnection.request('vm.create', 
+          sc.encode(JSON.stringify({
+            requestId: uuidv4(),
+            userId: userId,
+            terminalId: terminalId,
+            requestedAt: Date.now()
+          })),
+          { timeout: 10000 }
+        );
+        
+        const vmData = JSON.parse(sc.decode(vmReply.data));
+        
+        if (vmData.status === 'accepted') {
+          // Request accepted, wait for VM creation
+          ws.send(JSON.stringify({
+            type: 'vm_creating',
+            message: 'Your environment is being created. Please wait...'
+          }));
+        } else if (vmData.status === 'error') {
+          // Error creating VM
+          ws.send(JSON.stringify({
+            type: 'error',
+            message: `Failed to create environment: ${vmData.error}`
+          }));
+        }
+      }
+      
+      // Handle terminal input
+      else if (data.type === 'data' && ws.stream) {
+        ws.stream.write(data.data);
+      }
+      
+      // Handle terminal resize events
+      else if (data.type === 'resize' && ws.stream) {
+        ws.stream.setWindow(data.rows, data.cols, 0, 0);
+      }
     } catch (err) {
       console.error('Error processing message:', err);
-      ws.send(JSON.stringify({ type: 'error', message: `Message processing error: ${err.message}` }));
+      ws.send(JSON.stringify({ 
+        type: 'error', 
+        message: `Message processing error: ${err.message}` 
+      }));
     }
   });
   
   // Handle client disconnect
   ws.on('close', () => {
     console.log(`Terminal ${terminalId} from user ${userId} disconnected`);
-  
-    // Close SSH connection if exists
-    if (ws.stream) {
+    
+    // Notify instance manager about terminal disconnection
+    if (natsConnection) {
       try {
-        ws.stream.close();
+        natsConnection.publish('terminal.disconnected', sc.encode(JSON.stringify({
+          userId: userId,
+          terminalId: terminalId,
+          timestamp: Date.now()
+        })));
       } catch (e) {
-        console.error('Error closing stream:', e);
+        console.error('Error publishing terminal disconnect event:', e);
       }
     }
     
-    if (ws.ssh) {
-      try {
-        ws.ssh.end();
-      } catch (e) {
-        console.error('Error ending SSH connection:', e);
-      }
-    }
-    
-    // Check if there's a pending VM request for this user
-    if (pendingVMRequests.has(userId)) {
-      console.log(`User ${userId} disconnected with pending VM request`);
-      const pendingRequest = pendingVMRequests.get(userId);
-      pendingRequest.terminals.delete(terminalId);
-      pendingRequest.pendingConnections.delete(terminalId);
-      
-      // Log the pending request status
-      console.log(`Pending request now has ${pendingRequest.terminals.size} terminals`);
-      
-      // If no more terminals are waiting, DON'T delete the request immediately
-      // Keep it for a short time in case of a page reload
-      if (pendingRequest.terminals.size === 0) {
-        console.log(`No more terminals waiting for VM for user ${userId}, but keeping request for 10 seconds`);
-        
-        // Set a timeout to clean up the request after a delay (to handle page reloads)
-        setTimeout(() => {
-          // Check again if still empty
-          if (pendingVMRequests.has(userId)) {
-            const request = pendingVMRequests.get(userId);
-            if (request.terminals.size === 0) {
-              console.log(`Cleaning up pending VM request for ${userId} after delay`);
-              pendingVMRequests.delete(userId);
-              
-              // Optionally notify VM service to cancel creation if possible
-              // Your existing cancel code...
-            }
-          }
-        }, 10000); // 10 second delay
-      }
-      return;
-    }
-
-    // If not pending, check active sessions
-    const assignment = userSessions.get(userId);
-    if (assignment) {
-      assignment.terminals.delete(terminalId);
-      
-      // Only release the VM if no terminals from this user are connected
-      if (assignment.terminals.size === 0) {
-        console.log(`No more terminals from user ${userId}, releasing VM ${assignment.vmId}`);
-        releaseVM(userId);
-      } else {
-        console.log(`User ${userId} still has ${assignment.terminals.size} active terminals`);
-      }
-    }
+    // Clean up connections
+    closeTerminalConnection(terminalId);
   });
 });
 
-// Periodically check for abandoned pending requests and deletion requests
+// Log active connections periodically
 setInterval(() => {
-  const now = Date.now();
+  console.log(`\n--- WebSocket Server Status ---`);
+  console.log(`Active terminals: ${activeTerminals.size}`);
+  console.log(`Active users: ${userTerminals.size}`);
   
-  // Check for abandoned pending VM requests
-  pendingVMRequests.forEach((request, userId) => {
-    // If a pending request is older than 10 minutes, consider it abandoned
-    if (now - request.requestedAt > 600000) { // 10 minutes
-      console.log(`Pending VM request for user ${userId} timed out`);
-      
-      // Notify all waiting terminals
-      request.pendingConnections.forEach((ws) => {
-        try {
-          ws.send(JSON.stringify({
-            type: 'error',
-            message: 'Environment creation timed out. Please try again.'
-          }));
-        } catch (e) {
-          console.error('Error sending timeout message:', e);
-        }
-      });
-      
-      // Clean up the pending request
-      pendingVMRequests.delete(userId);
-      
-      // Try to cancel VM creation using request-reply pattern
-      if (natsConnection) {
-        try {
-          const requestId = uuidv4();
-          natsConnection.request('vm.cancel', sc.encode(JSON.stringify({
-            requestId: requestId,
-            userId: userId,
-            reason: 'timeout',
-            timestamp: Date.now()
-          })), { timeout: 5000 }).then(reply => {
-            const response = JSON.parse(sc.decode(reply.data));
-            console.log(`VM cancel request for abandoned request acknowledged: ${JSON.stringify(response)}`);
-          }).catch(err => {
-            console.error(`Error in VM cancel request for abandoned request:`, err);
-          });
-        } catch (e) {
-          console.error('Error initiating cancel message for abandoned request:', e);
-        }
-      }
+  // Show active users and their terminal counts
+  if (userTerminals.size > 0) {
+    console.log(`\nActive user sessions:`);
+    for (const [userId, terminals] of userTerminals.entries()) {
+      console.log(`- User ${userId}: ${terminals.size} terminal(s)`);
     }
-  });
+  }
   
-  // Check for stuck VM deletion requests
-  pendingVMDeletions.forEach((deletion, requestId) => {
-    // If a deletion request is older than 5 minutes, consider it stuck
-    if (now - deletion.requestedAt > 300000) { // 5 minutes
-      console.log(`VM deletion request ${requestId} for VM ${deletion.vmId} has been pending for over 5 minutes`);
-      
-      // Retry the deletion with a new request ID
-      if (natsConnection) {
-        try {
-          const newRequestId = uuidv4();
-          console.log(`Retrying deletion with new request ID: ${newRequestId}`);
-          
-          natsConnection.request('vm.delete', sc.encode(JSON.stringify({
-            requestId: newRequestId,
-            originalRequestId: requestId,
-            vmId: deletion.vmId,
-            userId: deletion.userId,
-            reason: `${deletion.reason}_retry`,
-            timestamp: Date.now(),
-            isRetry: true
-          })), { timeout: 10000 }).then(reply => {
-            const response = JSON.parse(sc.decode(reply.data));
-            console.log(`VM deletion retry acknowledged: ${JSON.stringify(response)}`);
-            
-            // Track this as a new deletion request
-            pendingVMDeletions.set(newRequestId, {
-              ...deletion,
-              requestedAt: Date.now(),
-              isRetry: true,
-              originalRequestId: requestId
-            });
-            
-          }).catch(err => {
-            console.error(`Error in VM deletion retry:`, err);
-          });
-          
-          // Remove the original request regardless of retry outcome
-          pendingVMDeletions.delete(requestId);
-          
-        } catch (e) {
-          console.error(`Error initiating deletion retry for stuck request ${requestId}:`, e);
-        }
-      }
-    }
-  });
-}, 60000); // Check every minute
+  console.log(`------------------------------\n`);
+}, 300000); // Log every 5 minutes
 
-// Periodically log system status
-setInterval(() => {
-  const now = Date.now();
+// Handle cleanup on shutdown
+process.on('SIGINT', async () => {
+  console.log('Shutting down WebSocket server...');
   
-  console.log(`\n--- System Status at ${new Date(now).toISOString()} ---`);
-  console.log(`Active VM pool: ${vmPool.length} VMs`);
-  console.log(`Active user sessions: ${userSessions.size}`);
-  console.log(`Pending VM requests: ${pendingVMRequests.size}`);
-  console.log(`Pending VM deletions: ${pendingVMDeletions.size}`);
-  console.log(`Users in cooldown: ${terminatedUsers.size}`);
-  
-  // Detailed VM Pool Stats
-  if (vmPool.length > 0) {
-    console.log(`\nVM Pool Details:`);
-    vmPool.forEach(vm => {
-      console.log(`- VM ${vm.id} (${vm.ip}): ${vm.busy ? 'Busy' : 'Available'}${vm.userId ? ` (used by ${vm.userId})` : ''}`);
-    });
+  // Close all active connections
+  for (const terminalId of activeTerminals.keys()) {
+    closeTerminalConnection(terminalId);
   }
   
-  // User sessions with their VMs
-  if (userSessions.size > 0) {
-    console.log(`\nUser Sessions:`);
-    userSessions.forEach((session, userId) => {
-      const sessionDuration = Math.floor((now - session.assignedAt) / 1000);
-      const timeLeft = Math.floor((ENV_SESSION_DURATION - (now - session.assignedAt)) / 1000);
-      
-      console.log(`- User ${userId}: VM ${session.vmId} (${session.vmIp})`);
-      console.log(`  Terminals: ${session.terminals.size}, Duration: ${sessionDuration}s, Time left: ${timeLeft}s`);
-    });
+  // Drain NATS connection
+  if (natsConnection) {
+    await natsConnection.drain();
+    console.log('NATS connection drained');
   }
   
-  // Users in cooldown
-  if (terminatedUsers.size > 0) {
-    console.log(`\nUsers in Cooldown:`);
-    terminatedUsers.forEach((expiryTime, userId) => {
-      const cooldownLeft = Math.floor((expiryTime - now) / 1000);
-      console.log(`- User ${userId}: ${cooldownLeft}s remaining`);
-    });
-  }
-  
-  console.log(`---------------------------------------------\n`);
-}, 300000); // Log status every 5 minutes
+  process.exit(0);
+});
 
+// Start server
 const port = process.env.WS_PORT || 8081;
 console.log(`WebSocket server running on port ${port}`);
-
-// Log initial configuration
-console.log(`Server configuration:
-- Environment session duration: ${ENV_SESSION_DURATION}ms (${ENV_SESSION_DURATION/60000} minutes)
-- User cooldown duration: ${USER_COOLDOWN_DURATION}ms (${USER_COOLDOWN_DURATION/60000} minutes)
-- Environment check interval: ${ENV_CHECK_INTERVAL}ms
-- NATS server: ${NATS_URL}
-`);
+console.log(`NATS server: ${NATS_URL}`);
 
 // Connect to NATS and start the server
 connectToNATS().catch(error => {
