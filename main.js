@@ -108,9 +108,12 @@ async function processVMExpiringNotifications(subscription) {
       }
     } catch (error) {
       console.error('Error processing vm.expiring notification:', error);
-      // Still respond with acknowledgment to prevent blockage
+      // Respond with failure to prevent VM deletion on error
       if (msg.reply) {
-        msg.respond(sc.encode(JSON.stringify({ acknowledged: true, error: error.message })));
+        msg.respond(sc.encode(JSON.stringify({ 
+          acknowledged: false, 
+          error: error.message 
+        })));
       }
     }
   }
