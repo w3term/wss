@@ -77,17 +77,25 @@ async function processVMCreatedNotifications(subscription) {
 async function processVMExpiringNotifications(subscription) {
   for await (const msg of subscription) {
     try {
+      // Parse the message data
       const expData = JSON.parse(sc.decode(msg.data));
-      console.log(`Received VM expiring notification for user: ${expData.userId}`);
+      console.log(`Received VM expiring notification for user: ${expData.userId}, VM: ${expData.vmId}`);
       
-      // Send timeout notification to all of user's terminals
+      // Always prepare a success response
+      const expiryReplyData = { acknowledged: true };
+      let terminalsFound = false;
+      
+      // Only attempt notification if the user has terminals
       if (userTerminals.has(expData.userId)) {
         const terminals = userTerminals.get(expData.userId);
-        const expiryReplyData = { acknowledged: true };
+        terminalsFound = terminals.size > 0;
         
+        // Notify all terminals for this user
         for (const terminalId of terminals) {
           const terminalData = activeTerminals.get(terminalId);
           if (terminalData && terminalData.ws.readyState === WebSocket.OPEN) {
+            console.log(`Notifying terminal ${terminalId} about VM expiration`);
+            
             // Send session expiration message to client
             terminalData.ws.send(JSON.stringify({
               type: 'environment_terminated',
@@ -100,20 +108,27 @@ async function processVMExpiringNotifications(subscription) {
             closeTerminalConnection(terminalId);
           }
         }
-        
-        // Reply to the request to acknowledge the expiration
-        if (msg.reply) {
-          msg.respond(sc.encode(JSON.stringify(expiryReplyData)));
-        }
+      }
+      
+      console.log(`Responding to VM expiring for user ${expData.userId} (terminals found: ${terminalsFound})`);
+      
+      // Always respond to the request to prevent timeout
+      if (msg.reply) {
+        msg.respond(sc.encode(JSON.stringify(expiryReplyData)));
+      } else {
+        console.log(`Warning: No reply subject in vm.expiring message`);
       }
     } catch (error) {
       console.error('Error processing vm.expiring notification:', error);
-      // Respond with failure to prevent VM deletion on error
+      
+      // Respond with failure even on error to prevent timeout
       if (msg.reply) {
         msg.respond(sc.encode(JSON.stringify({ 
           acknowledged: false, 
           error: error.message 
         })));
+      } else {
+        console.error('No reply subject available to respond with error');
       }
     }
   }
@@ -350,11 +365,11 @@ wss.on('connection', async (ws, req) => {
   ws.on('message', async (message) => {
     try {
       const data = JSON.parse(message);
-      
+
       // Handle authentication/VM session request
       if (data.type === 'auth') {
         // Check if user can have a VM session
-        const sessionReply = await natsConnection.request('vm.session.check', 
+        const sessionReply = await natsConnection.request('vm.check', 
           sc.encode(JSON.stringify({
             userId: userId,
             terminalId: terminalId
@@ -363,7 +378,9 @@ wss.on('connection', async (ws, req) => {
         );
         
         const sessionData = JSON.parse(sc.decode(sessionReply.data));
-        
+
+        console.log("Reply from instances manager", sessionData);
+
         if (sessionData.status === 'cooldown') {
           // User is in cooldown period
           ws.send(JSON.stringify({
@@ -373,9 +390,9 @@ wss.on('connection', async (ws, req) => {
           }));
           return;
         }
-        
-        if (sessionData.status === 'existing_session') {
-          // User has an existing session, connect to it
+
+        // Connec to the active VM existing for the current user
+        if (sessionData.status === 'active') {
           ws.send(JSON.stringify({
             type: 'vm_ready',
             message: 'Your environment is ready',
@@ -388,26 +405,12 @@ wss.on('connection', async (ws, req) => {
           return;
         }
         
-        if (sessionData.status === 'pending') {
+        if (sessionData.status === 'creating') {
           // VM is being created, notification will come later
           ws.send(JSON.stringify({
             type: 'vm_creating',
             message: 'Your environment is being created. Please wait...'
           }));
-          return;
-        }
-        
-        if (sessionData.status === 'ready') {
-          // Request granted immediately with ready VM
-          ws.send(JSON.stringify({
-            type: 'vm_ready',
-            message: 'Your environment is ready',
-            vmId: sessionData.vmId,
-            ip: sessionData.vmIp
-          }));
-          
-          // Connect to the VM
-          establishSSHConnection(ws, sessionData.vmIp);
           return;
         }
         
