@@ -3,6 +3,8 @@ const { Client } = require('ssh2');
 const fs = require('fs');
 const { connect, StringCodec } = require('nats');
 const { v4: uuidv4 } = require('uuid');
+const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 require('dotenv').config();
 
 // NATS connection configuration
@@ -10,7 +12,7 @@ const NATS_URL = process.env.NATS_URL || 'nats://localhost:4222';
 let natsConnection = null;
 const sc = StringCodec();
 
-// Connection tracking - only track what the WebSocket server needs to know
+// Connection tracking
 const activeTerminals = new Map(); // Map of terminalId -> { ws, sshClient, stream }
 const userTerminals = new Map();   // Map of userId -> Set of terminalIds
 
@@ -330,30 +332,81 @@ function closeTerminalConnection(terminalId) {
 }
 
 // Create WebSocket server
-const wss = new WebSocket.Server({ port: process.env.WS_PORT || 8081 });
+const wss = new WebSocket.Server({ 
+  port: process.env.WS_PORT || 8081,
+});
 
+// websocket connection handler
 wss.on('connection', async (ws, req) => {
+  console.log("New WebSocket connection attempt");
+  console.log("URL:", req.url);
+
   // Parse query parameters
   const urlParams = new URL(`http://localhost${req.url}`).searchParams;
-  
-  const userId = urlParams.get('userid');
-  if (!userId) {
+  console.log("URL params:", Object.fromEntries(urlParams.entries()));
+
+  // Get token from URL parameters
+  const authToken = urlParams.get('token');
+
+  if (!authToken) {
+    console.warn('Connection attempt with no auth token');
     ws.send(JSON.stringify({ type: 'error', message: 'Authentication required' }));
     ws.close();
     return;
   }
 
+  // Log the JWT secret configuration
+  console.log(`JWT_SECRET defined: ${!!process.env.JWT_SECRET}`);
+  if (process.env.JWT_SECRET) {
+    console.log(`JWT_SECRET length: ${process.env.JWT_SECRET.length} characters`);
+  } else {
+    console.error("JWT_SECRET is not defined in environment variables!");
+    ws.send(JSON.stringify({ type: 'error', message: 'Server authentication configuration error' }));
+    ws.close();
+    return;
+  }
+
+  // Verify JWT token
+  let decodedToken;
+  try {
+    console.log(`Verifying token (first 10 chars): ${authToken.substring(0, 10)}...`);
+    decodedToken = jwt.verify(authToken, process.env.JWT_SECRET);
+    console.log("Token verification successful:", decodedToken);
+    
+    // Create verifiedUser object that the rest of your code expects
+    req.verifiedUser = {
+      userId: decodedToken.username,  // Using username from your Go auth server
+      githubId: decodedToken.githubId // Also available if needed
+    };
+  } catch (error) {
+    console.error("Token verification failed:", error.message);
+    ws.send(JSON.stringify({ type: 'error', message: 'Authentication required' }));
+    ws.close();
+    return;
+  }
+
+  // Use the verified user ID from the token
+  const userId = req.verifiedUser.userId;
+
   // Terminal ID is unique per terminal tab
   const terminalId = urlParams.get('terminalid') || `terminal_${Date.now()}_${Math.random().toString(36).substring(2, 15)}`;
   
-  console.log(`Terminal ${terminalId} connected from user ${userId}`);
+  // Check if we should force existing session check
+  const checkSession = urlParams.get('checksession') === 'true';
+  
+  console.log(`Terminal ${terminalId} connected from user ${userId}${checkSession ? ' (with session check)' : ''}`);
   
   // Store session info on the websocket object
   ws.userId = userId;
   ws.terminalId = terminalId;
   
+  // Generate a connection-specific security token
+  // This can be used to validate commands on the WebSocket server
+  const connectionToken = crypto.randomBytes(16).toString('hex');
+  ws.connectionToken = connectionToken;
+  
   // Track this terminal
-  activeTerminals.set(terminalId, { ws, userId, ssh: null, stream: null });
+  activeTerminals.set(terminalId, { ws, userId, ssh: null, stream: null, connectionToken });
   
   // Add to user's terminals set
   if (!userTerminals.has(userId)) {
@@ -361,102 +414,163 @@ wss.on('connection', async (ws, req) => {
   }
   userTerminals.get(userId).add(terminalId);
   
+  // Send the connection token to the client
+  ws.send(JSON.stringify({
+    type: 'connection_established',
+    connectionToken: connectionToken
+  }));
+  
+  // When checkSession is true, immediately check for existing sessions
+  if (checkSession) {
+    try {
+      // Check if user has an active VM session
+      const sessionReply = await natsConnection.request('vm.check', 
+        sc.encode(JSON.stringify({
+          userId: userId,
+          terminalId: terminalId,
+          forceCheck: true // Add this flag to ensure VM manager checks thoroughly
+        })),
+        { timeout: 10000 }
+      );
+      
+      const sessionData = JSON.parse(sc.decode(sessionReply.data));
+      console.log("Session check reply from instances manager:", sessionData);
+
+      if (sessionData.status === 'active') {
+        ws.send(JSON.stringify({
+          type: 'vm_ready',
+          message: 'Your environment is ready',
+          vmId: sessionData.vmId,
+          ip: sessionData.vmIp
+        }));
+        
+        // Connect to the VM
+        establishSSHConnection(ws, sessionData.vmIp);
+      }
+    } catch (error) {
+      console.error('Error checking for existing sessions:', error);
+    }
+  }
+  
   // Handle messages from client
   ws.on('message', async (message) => {
     try {
+      // Try to parse as JSON
       const data = JSON.parse(message);
 
-      // Handle authentication/VM session request
-      if (data.type === 'auth') {
-        // Check if user can have a VM session
-        const sessionReply = await natsConnection.request('vm.check', 
-          sc.encode(JSON.stringify({
-            userId: userId,
-            terminalId: terminalId
-          })),
-          { timeout: 10000 }
-        );
-        
-        const sessionData = JSON.parse(sc.decode(sessionReply.data));
-
-        console.log("Reply from instances manager", sessionData);
-
-        if (sessionData.status === 'cooldown') {
-          // User is in cooldown period
-          ws.send(JSON.stringify({
-            type: 'error',
-            message: `Your previous session has expired. You can request a new session at ${sessionData.cooldown.formattedTime}.`,
-            cooldown: sessionData.cooldown
-          }));
-          return;
-        }
-
-        // Connec to the active VM existing for the current user
-        if (sessionData.status === 'active') {
-          ws.send(JSON.stringify({
-            type: 'vm_ready',
-            message: 'Your environment is ready',
-            vmId: sessionData.vmId,
-            ip: sessionData.vmIp
-          }));
+      // Process message based on type
+      switch (data.type) {
+        // Handle authentication/VM session request
+        case 'auth':
+          // Check if user can have a VM session
+          const sessionReply = await natsConnection.request('vm.check', 
+            sc.encode(JSON.stringify({
+              userId: userId,
+              terminalId: terminalId
+            })),
+            { timeout: 10000 }
+          );
           
-          // Connect to the VM
-          establishSSHConnection(ws, sessionData.vmIp);
-          return;
-        }
-        
-        if (sessionData.status === 'creating') {
-          // VM is being created, notification will come later
-          ws.send(JSON.stringify({
-            type: 'vm_creating',
-            message: 'Your environment is being created. Please wait...'
-          }));
-          return;
-        }
-        
-        // Request a new VM
-        const vmReply = await natsConnection.request('vm.create', 
-          sc.encode(JSON.stringify({
-            requestId: uuidv4(),
-            userId: userId,
-            terminalId: terminalId,
-            requestedAt: Date.now()
-          })),
-          { timeout: 10000 }
-        );
-        
-        const vmData = JSON.parse(sc.decode(vmReply.data));
-        
-        if (vmData.status === 'accepted') {
-          // Request accepted, wait for VM creation
-          ws.send(JSON.stringify({
-            type: 'vm_creating',
-            message: 'Your environment is being created. Please wait...'
-          }));
-        } else if (vmData.status === 'error') {
-          // Error creating VM
-          ws.send(JSON.stringify({
-            type: 'error',
-            message: `Failed to create environment: ${vmData.error}`
-          }));
-        }
-      }
-      
-      // Handle terminal input
-      else if (data.type === 'data' && ws.stream) {
-        ws.stream.write(data.data);
-      }
-      
-      // Handle terminal resize events
-      else if (data.type === 'resize' && ws.stream) {
-        ws.stream.setWindow(data.rows, data.cols, 0, 0);
+          const sessionData = JSON.parse(sc.decode(sessionReply.data));
+          console.log("Reply from instances manager", sessionData);
+
+          if (sessionData.status === 'cooldown') {
+            // User is in cooldown period
+            ws.send(JSON.stringify({
+              type: 'error',
+              message: `Your previous session has expired. You can request a new session at ${sessionData.cooldown.formattedTime}.`,
+              cooldown: sessionData.cooldown
+            }));
+            return;
+          }
+
+          // Connect to the active VM existing for the current user
+          if (sessionData.status === 'active') {
+            ws.send(JSON.stringify({
+              type: 'vm_ready',
+              message: 'Your environment is ready',
+              vmId: sessionData.vmId,
+              ip: sessionData.vmIp
+            }));
+            
+            // Connect to the VM
+            establishSSHConnection(ws, sessionData.vmIp);
+            return;
+          }
+          
+          if (sessionData.status === 'creating') {
+            // VM is being created, notification will come later
+            ws.send(JSON.stringify({
+              type: 'vm_creating',
+              message: 'Your environment is being created. Please wait...'
+            }));
+            return;
+          }
+          
+          // Request a new VM
+          const vmReply = await natsConnection.request('vm.create', 
+            sc.encode(JSON.stringify({
+              requestId: uuidv4(),
+              userId: userId,
+              terminalId: terminalId,
+              requestedAt: Date.now()
+            })),
+            { timeout: 10000 }
+          );
+          
+          const vmData = JSON.parse(sc.decode(vmReply.data));
+          
+          if (vmData.status === 'accepted') {
+            // Request accepted, wait for VM creation
+            ws.send(JSON.stringify({
+              type: 'vm_creating',
+              message: 'Your environment is being created. Please wait...'
+            }));
+          } else if (vmData.status === 'error') {
+            // Error creating VM
+            ws.send(JSON.stringify({
+              type: 'error',
+              message: `Failed to create environment: ${vmData.error}`
+            }));
+          }
+          break;
+          
+        // Handle terminal input - high-frequency data, no security check needed
+        case 'data':
+          if (ws.stream) {
+            ws.stream.write(data.data);
+          }
+          break;
+          
+        // Handle terminal resize events
+        case 'resize':
+          if (ws.stream) {
+            ws.stream.setWindow(data.rows, data.cols, 0, 0);
+          }
+          break;
+          
+        default:
+          console.warn(`Unknown message type: ${data.type}`);
       }
     } catch (err) {
-      console.error('Error processing message:', err);
-      ws.send(JSON.stringify({ 
-        type: 'error', 
-        message: `Message processing error: ${err.message}` 
-      }));
+      // Not valid JSON, try to treat as raw terminal data
+      if (ws.stream) {
+        try {
+          ws.stream.write(message);
+        } catch (streamErr) {
+          console.error('Error writing to stream:', streamErr);
+          ws.send(JSON.stringify({ 
+            type: 'error', 
+            message: `Stream error: ${streamErr.message}` 
+          }));
+        }
+      } else {
+        console.error('Error processing message:', err);
+        ws.send(JSON.stringify({ 
+          type: 'error', 
+          message: `Message processing error: ${err.message}` 
+        }));
+      }
     }
   });
   
