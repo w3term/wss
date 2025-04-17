@@ -16,6 +16,9 @@ const sc = StringCodec();
 const activeTerminals = new Map(); // Map of terminalId -> { ws, sshClient, stream }
 const userTerminals = new Map();   // Map of userId -> Set of terminalIds
 
+// Maximum number of terminals per user
+const MAX_TERMINALS_PER_USER = 4;
+
 // Connect to NATS
 async function connectToNATS() {
   try {
@@ -412,6 +415,20 @@ wss.on('connection', async (ws, req) => {
   if (!userTerminals.has(userId)) {
     userTerminals.set(userId, new Set());
   }
+
+  // Check terminal limit before adding this new terminal
+  const userTerminalSet = userTerminals.get(userId);
+  if (userTerminalSet.size >= MAX_TERMINALS_PER_USER) {
+    console.log(`User ${userId} exceeded terminal limit (${MAX_TERMINALS_PER_USER})`);
+    ws.send(JSON.stringify({ 
+      type: 'error', 
+      message: `You have reached the maximum limit of ${MAX_TERMINALS_PER_USER} terminal sessions.`
+    }));
+    ws.close();
+    return;
+  }
+  
+  // If within limits, proceed with adding the terminal
   userTerminals.get(userId).add(terminalId);
   
   // Send the connection token to the client
