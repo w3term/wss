@@ -339,11 +339,11 @@ const wss = new WebSocket.Server({
 // websocket connection handler
 wss.on('connection', async (ws, req) => {
   console.log("New WebSocket connection attempt");
-  console.log("URL:", req.url);
+  //console.log("URL:", req.url);
 
   // Parse query parameters
   const urlParams = new URL(`http://localhost${req.url}`).searchParams;
-  console.log("URL params:", Object.fromEntries(urlParams.entries()));
+  //console.log("URL params:", Object.fromEntries(urlParams.entries()));
 
   // Get token from URL parameters
   const authToken = urlParams.get('token');
@@ -356,9 +356,9 @@ wss.on('connection', async (ws, req) => {
   }
 
   // Log the JWT secret configuration
-  console.log(`JWT_SECRET defined: ${!!process.env.JWT_SECRET}`);
+  //console.log(`JWT_SECRET defined: ${!!process.env.JWT_SECRET}`);
   if (process.env.JWT_SECRET) {
-    console.log(`JWT_SECRET length: ${process.env.JWT_SECRET.length} characters`);
+    //console.log(`JWT_SECRET length: ${process.env.JWT_SECRET.length} characters`);
   } else {
     console.error("JWT_SECRET is not defined in environment variables!");
     ws.send(JSON.stringify({ type: 'error', message: 'Server authentication configuration error' }));
@@ -369,9 +369,9 @@ wss.on('connection', async (ws, req) => {
   // Verify JWT token
   let decodedToken;
   try {
-    console.log(`Verifying token (first 10 chars): ${authToken.substring(0, 10)}...`);
+    //console.log(`Verifying token (first 10 chars): ${authToken.substring(0, 10)}...`);
     decodedToken = jwt.verify(authToken, process.env.JWT_SECRET);
-    console.log("Token verification successful:", decodedToken);
+    //console.log("Token verification successful:", decodedToken);
     
     // Create verifiedUser object that the rest of your code expects
     req.verifiedUser = {
@@ -478,7 +478,7 @@ wss.on('connection', async (ws, req) => {
             // User is in cooldown period
             ws.send(JSON.stringify({
               type: 'error',
-              message: `Your previous session has expired. You can request a new session at ${sessionData.cooldown.formattedTime}.`,
+              message: 'Your session has expired',
               cooldown: sessionData.cooldown
             }));
             return;
