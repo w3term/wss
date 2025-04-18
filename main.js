@@ -100,7 +100,10 @@ async function processVMExpiringNotifications(subscription) {
           const terminalData = activeTerminals.get(terminalId);
           if (terminalData && terminalData.ws.readyState === WebSocket.OPEN) {
             console.log(`Notifying terminal ${terminalId} about VM expiration`);
-            
+
+            // Set cooldown flag
+            terminalData.ws.inCooldown = true;
+
             // Send session expiration message to client
             terminalData.ws.send(JSON.stringify({
               type: 'environment_terminated',
@@ -109,8 +112,8 @@ async function processVMExpiringNotifications(subscription) {
               cooldown: expData.cooldown
             }));
             
-            // Close the SSH connection and WebSocket
-            closeTerminalConnection(terminalId);
+            // Close the connection immediately after sending
+            setTimeout(() => closeTerminalConnection(terminalId), 500);
           }
         }
       }
@@ -148,6 +151,28 @@ function establishSSHConnection(ws, vmIp) {
   
   let currentRetry = 0;
   let retryDelay = INITIAL_RETRY_DELAY;
+
+  // Skip SSH connection if user is in cooldown
+  if (ws.inCooldown) {
+    console.log(`Skipping SSH connection for ${ws.terminalId} - user ${ws.userId} is in cooldown`);
+    return;
+  }
+  
+  // Check if user is in cooldown by checking the user's terminals set
+  if (userTerminals.has(ws.userId)) {
+    const cooldownKey = `cooldown_${ws.userId}`;
+    if (global[cooldownKey]) {
+      console.log(`User ${ws.userId} is in cooldown - blocking SSH connection`);
+      ws.inCooldown = true;
+      return;
+    }
+  }
+
+  // Skip connection if no valid IP is provided
+  if (!vmIp || vmIp === 'undefined' || vmIp === 'null') {
+    console.log(`Skipping SSH connection - no valid IP address provided for terminal ${ws.terminalId}`);
+    return;
+  }
 
   // Function to attempt SSH connection with retries
   function attemptSSHConnection() {
@@ -492,12 +517,18 @@ wss.on('connection', async (ws, req) => {
           console.log("Reply from instances manager", sessionData);
 
           if (sessionData.status === 'cooldown') {
+            // Mark the websocket as in cooldown
+            ws.inCooldown = true;
+
             // User is in cooldown period
             ws.send(JSON.stringify({
               type: 'error',
               message: 'Your session has expired',
               cooldown: sessionData.cooldown
             }));
+
+              // Close this connection immediately after sending the message
+              setTimeout(() => ws.close(), 500);
             return;
           }
 
@@ -559,6 +590,11 @@ wss.on('connection', async (ws, req) => {
           }
           break;
           
+        case 'explicit_close':
+          console.log(`Explicit close request received for terminal ${data.terminalId || terminalId}`);
+          // No response needed, the WebSocket will be closed anyway
+          break;
+
         // Handle terminal resize events
         case 'resize':
           if (ws.stream) {
@@ -595,6 +631,9 @@ wss.on('connection', async (ws, req) => {
   ws.on('close', () => {
     console.log(`Terminal ${terminalId} from user ${userId} disconnected`);
     
+    // Clean up connections
+    closeTerminalConnection(terminalId);
+
     // Notify instance manager about terminal disconnection
     if (natsConnection) {
       try {
