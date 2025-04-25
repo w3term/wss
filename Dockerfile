@@ -1,9 +1,6 @@
-ARG NODE_VERSION=20.18.3
+FROM node:22.15-alpine
 
-FROM node:${NODE_VERSION}-alpine
-
-# Use production node environment by default.
-ENV NODE_ENV production
+ENV NODE_ENV=production
 
 WORKDIR /usr/src/app
 
@@ -22,4 +19,4 @@ COPY . .
 EXPOSE 8081
 
 # Run the application.
-CMD node main.js
+CMD ["node", "main.js"]
