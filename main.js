@@ -257,7 +257,7 @@ function establishSSHConnection(ws, vmIp) {
         host: vmIp,
         port: parseInt(process.env.SSH_PORT || '22'),
         username: process.env.VM_USER,
-        privateKey: fs.readFileSync(process.env.SSH_PRIVATE_KEY_PATH),
+        privateKey: fs.readFileSync(process.env.SSH_PRIVATE_KEY_PATH || '/etc/keys/cka'),
         readyTimeout: 30000,
         keepaliveInterval: 5000,
         keepaliveCountMax: 5
