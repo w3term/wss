@@ -8,7 +8,7 @@ const crypto = require('crypto');
 require('dotenv').config();
 
 // NATS connection configuration
-const NATS_URL = process.env.NATS_URL || 'nats://localhost:4222';
+const NATS_URL = process.env.NATS_URL || 'nats://nats:4222';
 let natsConnection = null;
 const sc = StringCodec();
 
