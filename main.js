@@ -8,7 +8,7 @@ const crypto = require('crypto');
 require('dotenv').config();
 
 // NATS connection configuration
-const NATS_URL = process.env.NATS_URL || 'nats://localhost:4222';
+const NATS_URL = process.env.NATS_URL || 'nats://nats:4222';
 let natsConnection = null;
 const sc = StringCodec();
 
@@ -384,10 +384,7 @@ wss.on('connection', async (ws, req) => {
   }
 
   // Log the JWT secret configuration
-  //console.log(`JWT_SECRET defined: ${!!process.env.JWT_SECRET}`);
-  if (process.env.JWT_SECRET) {
-    //console.log(`JWT_SECRET length: ${process.env.JWT_SECRET.length} characters`);
-  } else {
+  if (!process.env.JWT_SECRET) {
     console.error("JWT_SECRET is not defined in environment variables!");
     ws.send(JSON.stringify({ type: 'error', message: 'Server authentication configuration error' }));
     ws.close();
@@ -397,24 +394,37 @@ wss.on('connection', async (ws, req) => {
   // Verify JWT token
   let decodedToken;
   try {
-    //console.log(`Verifying token (first 10 chars): ${authToken.substring(0, 10)}...`);
     decodedToken = jwt.verify(authToken, process.env.JWT_SECRET);
-    //console.log("Token verification successful:", decodedToken);
     
-    // Create verifiedUser object that the rest of your code expects
     req.verifiedUser = {
-      userId: decodedToken.username,  // Using username from your Go auth server
-      githubId: decodedToken.githubId // Also available if needed
+      userId: decodedToken.username,
+      githubId: decodedToken.githubId
     };
   } catch (error) {
-    console.error("Token verification failed:", error.message);
-    ws.send(JSON.stringify({ type: 'error', message: 'Authentication required' }));
-    ws.close();
-    return;
+    if (error.name === 'TokenExpiredError') {
+      console.error("Token has expired:", error.message);
+      ws.send(JSON.stringify({ type: 'error', message: 'Token expired' }));
+      ws.close();
+      return;
+    } else if (error.name === 'JsonWebTokenError') {
+      console.error("Invalid token:", error.message);
+      ws.send(JSON.stringify({ type: 'error', message: 'Invalid token' }));
+      ws.close();
+      return;
+    } else {
+      console.error("Token verification failed:", error.message);
+      ws.send(JSON.stringify({ type: 'error', message: 'Authentication required' }));
+      ws.close();
+      return;
+    }
   }
 
   // Use the verified user ID from the token
   const userId = req.verifiedUser.userId;
+
+  // Get VM type from URL parameters
+  const vmType = urlParams.get('vmtype');
+  console.log(`Type of VM requested: ${vmType}`);
 
   // Terminal ID is unique per terminal tab
   const terminalId = urlParams.get('terminalid') || `terminal_${Date.now()}_${Math.random().toString(36).substring(2, 15)}`;
@@ -427,6 +437,7 @@ wss.on('connection', async (ws, req) => {
   // Store session info on the websocket object
   ws.userId = userId;
   ws.terminalId = terminalId;
+  ws.vmType = vmType;
   
   // Generate a connection-specific security token
   // This can be used to validate commands on the WebSocket server
@@ -561,6 +572,7 @@ wss.on('connection', async (ws, req) => {
               requestId: uuidv4(),
               userId: userId,
               terminalId: terminalId,
+              vmType: vmType,
               requestedAt: Date.now()
             })),
             { timeout: 10000 }
